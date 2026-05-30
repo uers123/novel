@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 后端临时文件
+backend/novels/
+backend/settings.json
+backend/*.pyc
+
+# 模型文件 (8GB+)
+*.gguf
+*.bin
+
+# 系统和编辑器
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 日志
+*.log

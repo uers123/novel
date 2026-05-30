@@ -1,0 +1,414 @@
+/* style.css - AI 有声小说播放器 全局样式 */
+
+/* ============ Reset & Base ============ */
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body {
+  width: 100%; height: 100%; overflow: hidden;
+  font-family: var(--font-family-ui);
+  background: var(--bg-page);
+  color: var(--text-primary);
+  transition: background 0.3s, color 0.3s;
+}
+body { filter: var(--brightness-filter); }
+a { text-decoration: none; color: inherit; }
+button { border: none; background: none; cursor: pointer; font-family: inherit; color: inherit; font-size: inherit; }
+input, select { font-family: inherit; }
+/* Range slider */
+input[type="range"] {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 4px;
+  background: var(--bg-slider-track); border-radius: 2px; outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--bg-slider-handle);
+  border: 2px solid var(--accent);
+  cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+}
+::selection { background: var(--accent-light); color: var(--text-primary); }
+
+/* ============ View Management ============ */
+.view { display: none; width: 100%; height: 100%; position: absolute; top: 0; left: 0; }
+.view.active { display: flex; flex-direction: column; }
+
+/* ============ Icon Button ============ */
+.icon-btn {
+  width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; font-size: 20px; transition: background 0.2s;
+}
+.icon-btn:active { background: var(--border-color); }
+
+/* ============ Modal Overlay ============ */
+.modal-overlay {
+  display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background: var(--bg-modal); z-index: 100; justify-content: center; align-items: center;
+}
+.modal-overlay.active { display: flex; }
+
+/* ============================================================
+   书架页 (参考图4风格)
+   ============================================================ */
+.bookshelf-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; background: var(--bg-header);
+  border-bottom: 1px solid var(--border-color); flex-shrink: 0;
+}
+.app-title { font-size: 22px; font-weight: 700; color: var(--text-primary); }
+.header-actions { display: flex; gap: 4px; }
+
+.bookshelf-tabs {
+  display: flex; padding: 8px 16px; gap: 20px;
+  border-bottom: 1px solid var(--border-color); flex-shrink: 0;
+}
+.tab {
+  font-size: 14px; color: var(--text-secondary); cursor: pointer;
+  padding-bottom: 6px; border-bottom: 2px solid transparent; transition: all 0.2s;
+}
+.tab.active { color: var(--text-primary); border-bottom-color: var(--accent); font-weight: 600; }
+
+.bookshelf-grid {
+  flex: 1; overflow-y: auto; padding: 16px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 16px; align-content: start;
+}
+.book-card {
+  display: flex; flex-direction: column; align-items: center; cursor: pointer;
+  padding: 12px; border-radius: 12px; transition: background 0.2s;
+}
+.book-card:active { background: var(--border-color); }
+.book-cover {
+  width: 100px; height: 100px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 36px; color: #fff; font-weight: 700;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+.book-title { font-size: 14px; font-weight: 600; margin-top: 8px; text-align: center; }
+.book-author { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+.book-progress {
+  width: 80%; height: 3px; background: var(--bg-slider-track); border-radius: 2px; margin-top: 6px; overflow: hidden;
+}
+.book-progress-bar { height: 100%; background: var(--progress-color); border-radius: 2px; transition: width 0.3s; }
+
+.bookshelf-actions { position: fixed; bottom: 24px; right: 24px; z-index: 10; }
+.fab-btn {
+  width: 52px; height: 52px; border-radius: 50%; background: var(--accent);
+  color: #fff; font-size: 28px; box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+  display: flex; align-items: center; justify-content: center;
+  transition: transform 0.2s;
+}
+.fab-btn:active { transform: scale(0.92); }
+
+/* ============================================================
+   阅读页 (图1)
+   ============================================================ */
+.reader-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; background: var(--bg-header);
+  border-bottom: 1px solid var(--border-color); flex-shrink: 0;
+}
+.header-status { font-size: 12px; color: var(--text-secondary); }
+
+.reader-content {
+  flex: 1; overflow-y: auto; padding: 20px 24px;
+  background: var(--bg-reader); line-height: var(--reader-line-height, 1.8);
+  font-family: var(--font-family);
+}
+.chapter-title {
+  font-size: 20px; font-weight: 700; color: var(--text-primary);
+  text-align: center; margin-bottom: 20px;
+}
+.chapter-text {
+  font-size: var(--reader-font-size, 16px); color: var(--text-primary);
+  line-height: var(--reader-line-height, 1.8);
+}
+.chapter-text p {
+  text-indent: 2em; margin-bottom: 0.5em;
+}
+
+.reader-footer {
+  flex-shrink: 0; border-top: 1px solid var(--border-color);
+  background: var(--bg-footer);
+}
+.progress-bar-container {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 16px;
+}
+.prev-link, .next-link {
+  font-size: 13px; color: var(--text-link); cursor: pointer; white-space: nowrap;
+  flex-shrink: 0;
+}
+.prev-link:active, .next-link:active { color: var(--accent); }
+.progress-slider-wrap { flex: 1; }
+.progress-slider { width: 100%; }
+
+.reader-nav {
+  display: flex; justify-content: space-around;
+  padding: 6px 0 10px; border-top: 1px solid var(--border-color);
+}
+.nav-btn {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  font-size: 20px; color: var(--text-secondary); padding: 4px 12px;
+}
+.nav-btn span { font-size: 10px; color: var(--text-secondary); }
+.nav-btn:active { color: var(--accent); }
+
+/* 悬浮听按钮 (图1右下角) */
+.float-listen-btn {
+  position: fixed; bottom: 120px; right: 20px;
+  width: 56px; height: 56px; border-radius: 50%;
+  background: #666; color: #fff; font-size: 20px; font-weight: 600;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3); cursor: pointer;
+  z-index: 50; transition: transform 0.2s, opacity 0.3s;
+}
+.float-listen-btn:active { transform: scale(0.9); }
+.float-listen-btn.hidden { opacity: 0; pointer-events: none; }
+
+/* ============================================================
+   音频播放栏 (图2)
+   ============================================================ */
+.audio-bar {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  z-index: 90; display: none;
+}
+.audio-bar.active { display: block; }
+.audio-bar-inner {
+  display: flex; align-items: center; gap: 12px;
+  background: rgba(60, 60, 60, 0.88); backdrop-filter: blur(8px);
+  border-radius: 28px; padding: 8px 20px 8px 12px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+}
+.audio-play-btn {
+  width: 40px; height: 40px; border-radius: 50%;
+  background: #F0E8D8; display: flex; align-items: center; justify-content: center;
+  cursor: pointer; position: relative; flex-shrink: 0;
+}
+.play-indicator {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #E74C3C; position: absolute; top: -2px; right: -2px;
+}
+.audio-pause-icon {
+  color: #fff; font-size: 16px; cursor: pointer; width: 24px; text-align: center;
+}
+.audio-info {
+  color: #ddd; font-size: 13px; white-space: nowrap; min-width: 60px;
+}
+.audio-close {
+  color: #aaa; font-size: 18px; cursor: pointer; padding: 4px;
+  transition: color 0.2s;
+}
+.audio-close:active { color: #fff; }
+
+/* ============================================================
+   设置面板 (图3)
+   ============================================================ */
+.settings-panel {
+  background: var(--bg-panel); border-radius: 16px; width: 90%; max-width: 380px;
+  max-height: 80vh; overflow-y: auto; box-shadow: var(--shadow-heavy);
+}
+.settings-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid var(--border-color);
+}
+.settings-header h3 { font-size: 16px; font-weight: 600; }
+
+.settings-body { padding: 16px 20px; }
+.setting-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 0; border-bottom: 1px solid var(--divider-color);
+}
+.setting-row:last-child { border-bottom: none; }
+.setting-label { font-size: 14px; color: var(--text-primary); white-space: nowrap; }
+.setting-slider { flex: 1; min-width: 60px; }
+.setting-link { font-size: 12px; color: var(--text-link); cursor: pointer; white-space: nowrap; }
+.setting-link:active { color: var(--accent); }
+
+.color-palette { display: flex; gap: 6px; flex: 1; }
+.color-swatch {
+  width: 28px; height: 28px; border-radius: 50%; cursor: pointer;
+  border: 2px solid transparent; transition: border-color 0.2s; flex-shrink: 0;
+}
+.color-swatch.active { border-color: var(--accent) !important; }
+
+.page-effect-options { display: flex; gap: 4px; flex: 1; }
+.effect-option {
+  flex: 1; text-align: center; font-size: 12px; padding: 6px 2px;
+  background: var(--bg-slider-track); border-radius: 6px; cursor: pointer;
+  transition: all 0.2s; color: var(--text-secondary);
+}
+.effect-option.active { background: var(--accent); color: #fff; font-weight: 600; }
+
+.settings-footer {
+  display: flex; justify-content: center; align-items: center; gap: 8px;
+  padding: 12px 20px; border-top: 1px solid var(--border-color);
+}
+.settings-foot-link { font-size: 13px; color: var(--text-link); cursor: pointer; }
+.settings-foot-link:active { color: var(--accent); }
+.settings-divider { color: var(--divider-color); }
+
+/* ============================================================
+   语音选择 (图4)
+   ============================================================ */
+.voices-panel {
+  background: var(--bg-panel); border-radius: 16px; width: 90%; max-width: 380px;
+  max-height: 80vh; overflow-y: auto; box-shadow: var(--shadow-heavy);
+}
+.voices-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid var(--border-color);
+}
+.voices-header h3 { font-size: 16px; font-weight: 600; }
+.voices-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  padding: 16px 20px;
+}
+.voice-card {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  cursor: pointer; position: relative;
+}
+.voice-card:active .voice-avatar { transform: scale(0.92); }
+.voice-avatar {
+  width: 56px; height: 56px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px; transition: transform 0.2s;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+}
+.voice-name { font-size: 11px; color: var(--text-primary); text-align: center; }
+.voice-download {
+  position: absolute; top: 0; right: 4px;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--accent); color: #fff; font-size: 10px;
+  display: flex; align-items: center; justify-content: center;
+}
+
+/* ============================================================
+   目录面板
+   ============================================================ */
+.toc-panel {
+  position: fixed; top: 0; left: 0; width: 80%; max-width: 320px;
+  height: 100%; background: var(--bg-panel); box-shadow: var(--shadow-heavy);
+  z-index: 110; display: flex; flex-direction: column;
+  transform: translateX(-100%); transition: transform 0.3s;
+}
+.modal-overlay.active .toc-panel { transform: translateX(0); }
+.toc-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px; border-bottom: 1px solid var(--border-color);
+}
+.toc-body { flex: 1; overflow-y: auto; padding: 8px 0; }
+.toc-item {
+  padding: 12px 16px; cursor: pointer; font-size: 14px;
+  border-bottom: 1px solid var(--divider-color); transition: background 0.2s;
+}
+.toc-item:active { background: var(--border-color); }
+.toc-item.active { color: var(--accent); font-weight: 600; }
+
+/* ============================================================
+   导入面板
+   ============================================================ */
+.import-panel {
+  background: var(--bg-panel); border-radius: 16px; width: 90%; max-width: 380px;
+  box-shadow: var(--shadow-heavy);
+}
+.import-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid var(--border-color);
+}
+.import-body { padding: 16px 20px; }
+.import-section { margin: 12px 0; }
+.import-section h4 { font-size: 14px; margin-bottom: 8px; }
+.upload-zone {
+  border: 2px dashed var(--border-color); border-radius: 12px;
+  padding: 24px; text-align: center; cursor: pointer;
+  color: var(--text-secondary); font-size: 14px;
+  transition: border-color 0.2s, background 0.2s;
+}
+.upload-zone:active { border-color: var(--accent); background: var(--accent-light); }
+.import-input {
+  width: 100%; padding: 10px 12px; border: 1px solid var(--border-color);
+  border-radius: 8px; font-size: 14px; margin-bottom: 8px;
+  background: var(--bg-page); color: var(--text-primary);
+}
+.import-submit {
+  width: 100%; padding: 10px; background: var(--accent); color: #fff;
+  border-radius: 8px; font-size: 14px; font-weight: 600;
+}
+.import-submit:active { opacity: 0.85; }
+.import-divider {
+  text-align: center; font-size: 13px; color: var(--text-secondary);
+  margin: 8px 0; position: relative;
+}
+.import-divider::before, .import-divider::after {
+  content: ''; display: inline-block; width: 30%; height: 1px;
+  background: var(--divider-color); vertical-align: middle; margin: 0 8px;
+}
+.crawl-progress { text-align: center; font-size: 13px; color: var(--text-secondary); padding: 8px; }
+
+/* ============================================================
+   更多菜单
+   ============================================================ */
+.menu-panel {
+  background: var(--bg-panel); border-radius: 12px; width: 200px;
+  overflow: hidden; box-shadow: var(--shadow-heavy);
+}
+.menu-item {
+  padding: 14px 20px; font-size: 14px; cursor: pointer;
+  border-bottom: 1px solid var(--divider-color); transition: background 0.2s;
+}
+.menu-item:last-child { border-bottom: none; }
+.menu-item:active { background: var(--border-color); }
+
+/* ============================================================
+   翻译面板
+   ============================================================ */
+.translation-panel {
+  background: var(--bg-panel); border-radius: 16px; width: 90%; max-width: 420px;
+  max-height: 80vh; overflow-y: auto; box-shadow: var(--shadow-heavy);
+}
+.translation-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid var(--border-color);
+}
+.translation-body { padding: 16px 20px; }
+.trans-lang-row {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 12px;
+}
+.trans-lang-row select {
+  flex: 1; padding: 8px; border: 1px solid var(--border-color); border-radius: 8px;
+  font-size: 13px; background: var(--bg-page); color: var(--text-primary);
+}
+.trans-btn {
+  padding: 8px 16px; background: var(--accent); color: #fff;
+  border-radius: 8px; font-size: 13px; font-weight: 600; white-space: nowrap;
+}
+.trans-btn:active { opacity: 0.85; }
+.trans-result-box {
+  border: 1px solid var(--border-color); border-radius: 8px; padding: 12px;
+  max-height: 300px; overflow-y: auto;
+}
+.trans-original { font-size: 13px; color: var(--text-secondary); white-space: pre-wrap; }
+.trans-divider { height: 1px; background: var(--divider-color); margin: 8px 0; }
+.trans-result { font-size: 14px; color: var(--text-primary); white-space: pre-wrap; }
+
+/* ============================================================
+   通用
+   ============================================================ */
+.close-btn { font-size: 18px; color: var(--text-secondary); }
+
+/* ============================================================
+   响应式
+   ============================================================ */
+@media (max-width: 480px) {
+  .bookshelf-grid { grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .book-cover { width: 80px; height: 80px; font-size: 28px; }
+  .voices-grid { grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .voice-avatar { width: 48px; height: 48px; font-size: 18px; }
+  .reader-content { padding: 16px; }
+  .settings-panel, .voices-panel, .import-panel { width: 95%; }
+}
+
+@media (min-width: 768px) {
+  .bookshelf-grid { grid-template-columns: repeat(4, 1fr); }
+  .reader-content { padding: 30px 48px; max-width: 720px; margin: 0 auto; }
+}

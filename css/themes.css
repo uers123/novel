@@ -1,0 +1,126 @@
+/**
+ * themes.css - 主题系统
+ * 对应截图中的 白天/夜间/护眼/羊皮纸 模式
+ */
+
+/* ============ 主题变量（默认白天模式） ============ */
+:root {
+  --bg-page: #F5F0EB;
+  --bg-card: #FFFFFF;
+  --bg-reader: #F9F7F4;
+  --bg-header: rgba(249, 247, 244, 0.97);
+  --bg-footer: rgba(249, 247, 244, 0.97);
+  --bg-modal: rgba(0, 0, 0, 0.5);
+  --bg-panel: #FFFFFF;
+  --bg-slider-track: #DDD;
+  --bg-slider-handle: #F0E8D8;
+  --bg-icon: transparent;
+  --bg-voice: #E6EAF7;
+
+  --text-primary: #2D2D2D;
+  --text-secondary: #888;
+  --text-link: #666;
+  --text-on-dark: #FFFFFF;
+
+  --border-color: #EEE;
+  --divider-color: #E0E0E0;
+
+  --accent: #C9A96E;
+  --accent-light: #E8D5A8;
+  --progress-color: #C9A96E;
+
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+  --shadow-heavy: 0 4px 20px rgba(0, 0, 0, 0.15);
+
+  --font-family: "Songti SC", "SimSun", "Noto Serif CJK SC", "Source Han Serif SC", serif;
+  --font-family-ui: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+
+  --brightness-filter: brightness(1);
+}
+
+/* ============ 夜间模式 ============ */
+[data-theme="night"] {
+  --bg-page: #1A1A2E;
+  --bg-card: #222240;
+  --bg-reader: #1A1A2E;
+  --bg-header: rgba(26, 26, 46, 0.97);
+  --bg-footer: rgba(26, 26, 46, 0.97);
+  --bg-modal: rgba(0, 0, 0, 0.7);
+  --bg-panel: #222240;
+  --bg-slider-track: #444;
+  --bg-slider-handle: #555;
+  --bg-icon: transparent;
+  --bg-voice: #2A2A4A;
+
+  --text-primary: #C8C8C8;
+  --text-secondary: #888;
+  --text-link: #AAA;
+  --text-on-dark: #FFFFFF;
+
+  --border-color: #333;
+  --divider-color: #333;
+
+  --accent: #E8B84B;
+  --accent-light: #5A4A20;
+  --progress-color: #E8B84B;
+
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+  --shadow-heavy: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+/* ============ 护眼模式 ============ */
+[data-theme="eye"] {
+  --bg-page: #C7EDCC;
+  --bg-card: #D4F0D8;
+  --bg-reader: #C7EDCC;
+  --bg-header: rgba(199, 237, 204, 0.97);
+  --bg-footer: rgba(199, 237, 204, 0.97);
+  --bg-modal: rgba(0, 0, 0, 0.4);
+  --bg-panel: #D4F0D8;
+  --bg-slider-track: #A8D8B0;
+  --bg-slider-handle: #E8F5E8;
+  --bg-voice: #D0ECD5;
+
+  --text-primary: #3C5A3C;
+  --text-secondary: #5A7A5A;
+  --text-link: #4A6A4A;
+  --text-on-dark: #FFFFFF;
+
+  --border-color: #B8D8BD;
+  --divider-color: #B0D0B5;
+
+  --accent: #5A8A5A;
+  --accent-light: #A8D8A8;
+  --progress-color: #5A8A5A;
+
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+  --shadow-heavy: 0 4px 20px rgba(0, 0, 0, 0.12);
+}
+
+/* ============ 羊皮纸模式 ============ */
+[data-theme="parchment"] {
+  --bg-page: #F0E6D3;
+  --bg-card: #F5EDDE;
+  --bg-reader: #F0E6D3;
+  --bg-header: rgba(240, 230, 211, 0.97);
+  --bg-footer: rgba(240, 230, 211, 0.97);
+  --bg-panel: #F5EDDE;
+  --bg-slider-track: #D8C8B0;
+  --bg-slider-handle: #EDE0D0;
+  --bg-voice: #E8DECC;
+
+  --text-primary: #5C4A3A;
+  --text-secondary: #8A7A6A;
+  --text-link: #7A6A5A;
+  --text-on-dark: #FFFFFF;
+
+  --border-color: #D8C8B8;
+  --divider-color: #D0C0B0;
+
+  --accent: #B8860B;
+  --accent-light: #D4B896;
+  --progress-color: #B8860B;
+
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+  --shadow-heavy: 0 4px 20px rgba(0, 0, 0, 0.12);
+}
