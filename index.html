@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>AI 有声小说</title>
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/themes.css">
+</head>
+<body>
+<div id="view-bookshelf" class="view active">
+  <header class="bookshelf-header">
+    <h1 class="app-title">AI 有声小说</h1>
+    <div class="header-actions">
+      <button class="icon-btn" id="btn-search" aria-label="搜索">⌕</button>
+      <button class="icon-btn" id="btn-menu" aria-label="菜单">⋯</button>
+    </div>
+  </header>
+  <div class="bookshelf-tabs">
+    <span class="tab active" data-tab="all">全部</span>
+    <span class="tab" data-tab="reading">正在阅读</span>
+    <span class="tab" data-tab="done">已完成</span>
+  </div>
+  <div class="bookshelf-grid" id="bookshelf-grid"></div>
+  <div class="bookshelf-actions">
+    <button class="fab-btn" id="btn-import" title="导入小说">+</button>
+  </div>
+</div>
+
+<div id="view-reader" class="view">
+  <header class="reader-header">
+    <button class="icon-btn" id="btn-back" aria-label="返回">‹</button>
+    <span class="header-status" id="header-status">已在书架</span>
+    <button class="icon-btn" id="btn-more" aria-label="更多">⋯</button>
+  </header>
+
+  <main class="reader-content" id="reader-content">
+    <h2 class="chapter-title" id="chapter-title"></h2>
+    <div class="chapter-text" id="chapter-text"></div>
+  </main>
+
+  <footer class="reader-footer">
+    <div class="progress-bar-container">
+      <span class="prev-link" id="prev-chapter">上一章</span>
+      <div class="progress-slider-wrap">
+        <input type="range" class="progress-slider" id="progress-slider" min="0" max="100" value="0">
+      </div>
+      <span class="next-link" id="next-chapter">下一章</span>
+    </div>
+    <nav class="reader-nav">
+      <button class="nav-btn" id="nav-toc" aria-label="目录">☰<span>目录</span></button>
+      <button class="nav-btn" id="nav-night" aria-label="夜间">☾<span>夜间</span></button>
+      <button class="nav-btn" id="nav-settings" aria-label="设置">文<span>设置</span></button>
+      <button class="nav-btn" id="nav-voices" aria-label="语音">听<span>语音</span></button>
+    </nav>
+  </footer>
+
+  <button class="float-listen-btn" id="float-listen-btn">听</button>
+</div>
+
+<div class="audio-bar" id="audio-bar">
+  <div class="audio-bar-inner">
+    <button class="audio-play-btn" id="audio-play-btn" aria-label="播放或暂停">
+      <span class="play-indicator"></span>
+    </button>
+    <button class="audio-pause-icon" id="audio-pause-icon" aria-label="暂停">Ⅱ</button>
+    <div class="audio-info" id="audio-info">暂停中</div>
+    <button class="audio-close" id="audio-close" aria-label="关闭">×</button>
+  </div>
+</div>
+
+<div class="modal-overlay sheet-overlay" id="settings-modal">
+  <div class="settings-panel">
+    <div class="settings-body">
+      <div class="setting-row">
+        <span class="setting-label">☼</span>
+        <input type="range" class="setting-slider" id="brightness-slider" min="30" max="120" value="100">
+        <span class="setting-label">☀</span>
+      </div>
+      <div class="setting-row">
+        <span class="setting-label">A-</span>
+        <input type="range" class="setting-slider" id="fontsize-slider" min="14" max="34" value="20">
+        <span class="setting-bubble" id="fontsize-display">20</span>
+        <span class="setting-label">A+</span>
+        <span class="setting-link">系统字体 ›</span>
+      </div>
+      <div class="setting-row setting-row-wrap">
+        <div class="color-palette" id="color-palette">
+          <button class="color-swatch" data-color="#F6F3EC" style="background:#F6F3EC"></button>
+          <button class="color-swatch" data-color="#E4D8B6" style="background:#E4D8B6"></button>
+          <button class="color-swatch" data-color="#C5CCAD" style="background:#C5CCAD"></button>
+          <button class="color-swatch" data-color="#D6D8D1" style="background:#D6D8D1"></button>
+          <button class="color-swatch" data-color="#D7C28A" style="background:#D7C28A"></button>
+          <button class="color-swatch custom-bg" data-color="#EEF7FA">个性背景 ›</button>
+        </div>
+      </div>
+      <div class="setting-row page-effects" id="page-effect-options">
+        <button class="effect-option" data-effect="push"><span class="effect-icon">▯</span>平移翻页</button>
+        <button class="effect-option" data-effect="cover"><span class="effect-icon">▱</span>覆盖翻页</button>
+        <button class="effect-option" data-effect="simulation"><span class="effect-icon">◜</span>仿真翻页</button>
+        <button class="effect-option active" data-effect="updown"><span class="effect-icon">▤</span>上下翻页</button>
+      </div>
+    </div>
+    <div class="settings-footer">
+      <button class="settings-foot-link" id="set-eye-care">◉ 护眼模式</button>
+      <button class="settings-foot-link" id="set-auto-read">▣ 自动阅读</button>
+      <button class="settings-foot-link" id="set-more">☷ 更多设置</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="voices-modal">
+  <div class="voices-panel">
+    <div class="voices-header">
+      <h3>选择音色</h3>
+      <button class="icon-btn close-btn" id="voices-close">×</button>
+    </div>
+    <div class="voices-grid" id="voices-grid"></div>
+    <div class="voices-note" id="voices-note"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="toc-modal">
+  <div class="toc-panel">
+    <div class="toc-header">
+      <h3>目录</h3>
+      <button class="icon-btn close-btn" id="toc-close">×</button>
+    </div>
+    <div class="toc-body" id="toc-body"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="import-modal">
+  <div class="import-panel">
+    <div class="import-header">
+      <h3>导入小说</h3>
+      <button class="icon-btn close-btn" id="import-close">×</button>
+    </div>
+    <div class="import-body">
+      <div class="import-section">
+        <h4>上传 TXT 文件</h4>
+        <div class="upload-zone" id="upload-zone">
+          <p>点击或拖拽文件到此处</p>
+          <input type="file" id="file-input" accept=".txt" hidden>
+        </div>
+        <div class="upload-form" id="upload-form" style="display:none">
+          <input type="text" id="import-title" placeholder="小说名称" class="import-input">
+          <input type="text" id="import-author" placeholder="作者（可选）" class="import-input">
+          <button class="import-submit" id="import-submit">确认导入</button>
+        </div>
+      </div>
+      <div class="import-divider">或</div>
+      <div class="import-section">
+        <h4>从 URL 自动爬取</h4>
+        <input type="url" id="crawl-url" placeholder="小说目录页 URL" class="import-input">
+        <button class="import-submit" id="crawl-submit">开始爬取</button>
+        <div class="crawl-progress" id="crawl-progress" style="display:none">
+          <span id="crawl-progress-text">正在导入目录并预抓100章...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="menu-modal">
+  <div class="menu-panel">
+    <button class="menu-item" id="menu-translate">翻译本章</button>
+    <button class="menu-item" id="menu-export">导出 TXT</button>
+    <button class="menu-item" id="menu-info">关于</button>
+    <button class="menu-item danger" id="menu-delete">删除小说</button>
+  </div>
+</div>
+
+<div class="modal-overlay" id="translation-modal">
+  <div class="translation-panel">
+    <div class="translation-header">
+      <h3>翻译</h3>
+      <button class="icon-btn close-btn" id="translation-close">×</button>
+    </div>
+    <div class="translation-body">
+      <div class="trans-lang-row">
+        <select id="trans-source-lang">
+          <option value="auto">自动检测</option>
+          <option value="en">英语</option>
+          <option value="ja">日语</option>
+          <option value="ko">韩语</option>
+          <option value="fr">法语</option>
+          <option value="de">德语</option>
+          <option value="ru">俄语</option>
+        </select>
+        <span>→</span>
+        <select id="trans-target-lang">
+          <option value="zh-cn">简体中文</option>
+          <option value="en">英语</option>
+          <option value="ja">日语</option>
+        </select>
+        <button class="trans-btn" id="trans-btn-start">翻译</button>
+      </div>
+      <div class="trans-result-box" id="trans-result-box">
+        <div class="trans-original" id="trans-original"></div>
+        <div class="trans-divider"></div>
+        <div class="trans-result" id="trans-result">点击“翻译”开始</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="js/data.js"></script>
+<script src="js/settings.js"></script>
+<script src="js/toc.js"></script>
+<script src="js/reader.js"></script>
+<script src="js/audio.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
