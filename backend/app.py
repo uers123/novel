@@ -73,10 +73,18 @@ def read_json(path: Path, default: Any) -> Any:
 
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    tmp.replace(path)
+    # Use unique tmp name to avoid race conditions across threads
+    import threading
+    tid = threading.get_ident()
+    tmp = path.with_suffix(path.suffix + f".tmp.{tid}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp.replace(path)
+    finally:
+        # Clean up tmp file if replace failed and it still exists
+        if tmp.exists():
+            tmp.unlink()
 
 
 def split_sentences(text: str) -> list[str]:
@@ -381,6 +389,9 @@ class NovelManager:
             self._refresh_crawl_counts(novel_id)
             return True
         except Exception as exc:
+            import traceback
+            print(f"PREFETCH ERROR ch{chapter_index}: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
             self._mark_crawl_failed(novel_id, chapter_index, str(exc))
             return False
 
@@ -1025,4 +1036,4 @@ if __name__ == "__main__":
     print("Novel reader backend starting")
     print(f"Storage: {NOVELS_DIR}")
     print(f"URL: http://localhost:{port}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
