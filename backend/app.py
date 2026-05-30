@@ -469,6 +469,17 @@ class NovelManager:
             self._save_index()
             return True
 
+    def update_meta(self, novel_id: str, updates: dict[str, Any]) -> bool:
+        with self._lock:
+            if novel_id not in self._index:
+                return False
+            allowed = {"title", "author", "description", "coverColor"}
+            for key in allowed:
+                if key in updates:
+                    self._index[novel_id][key] = updates[key]
+            self._save_index()
+            return True
+
     def update_progress(self, novel_id: str, chapter_index: int) -> bool:
         with self._lock:
             if novel_id not in self._index:
@@ -489,6 +500,14 @@ class TTSService:
         self._lock = threading.Lock()
         self._speaker_cache: dict[str, Any] = {}
 
+        # GPU / VRAM settings (can be updated via API)
+        self.gpu = {
+            "maxBatchSize": 5,
+            "useHalfPrecision": True,
+            "clearCache": True,
+            "maxVRAM": 80,
+        }
+
         self.voices = [
             {"id": "ruanmeng_female", "name": "软萌萝莉", "gender": "female", "avatar": "萝", "seed": 11451},
             {"id": "child", "name": "萌娃童声", "gender": "child", "avatar": "童", "seed": 2222},
@@ -508,13 +527,56 @@ class TTSService:
             "surprise": {"prompt": "[oral_5][break_4]", "temperature": 0.6},
         }
 
+    def _cuda_available(self) -> bool:
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except Exception:
+            return False
+
+    def _clear_gpu_cache(self) -> None:
+        if not self.gpu.get("clearCache"):
+            return
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _vram_usage_pct(self) -> float:
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return 0
+            allocated = torch.cuda.memory_allocated()
+            total = torch.cuda.get_device_properties(0).total_memory
+            return (allocated / total) * 100 if total > 0 else 0
+        except Exception:
+            return 0
+
+    def _maybe_throttle_batch(self, requested: int) -> int:
+        vram_pct = self._vram_usage_pct()
+        limit = self.gpu.get("maxVRAM", 80)
+        if vram_pct > limit and requested > 1:
+            reduced = max(1, requested // 2)
+            import sys
+            print(f"  VRAM {vram_pct:.0f}% > {limit}% — throttling {requested}->{reduced}", file=sys.stderr)
+            return reduced
+        return min(requested, self.gpu.get("maxBatchSize", 5))
+
+    def update_gpu_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        for key in ("maxBatchSize", "useHalfPrecision", "clearCache", "maxVRAM"):
+            if key in settings:
+                self.gpu[key] = settings[key]
+        return dict(self.gpu)
+
     def list_voices(self) -> list[dict[str, Any]]:
         installed = self._chattts_available()
         return [{**voice, "installed": installed} for voice in self.voices]
 
     def _chattts_available(self) -> bool:
         try:
-            import ChatTTS  # noqa: F401
+            import ChatTTS
             return True
         except Exception:
             return False
@@ -527,13 +589,24 @@ class TTSService:
         try:
             import ChatTTS
             import numpy as np
+            import torch
 
             with self._lock:
                 if self._chat is None:
                     chat = ChatTTS.Chat()
                     chat.load(source="huggingface", compile=False)
+                    use_half = self._cuda_available() and self.gpu.get("useHalfPrecision", True)
+                    if use_half:
+                        try:
+                            if hasattr(chat, 'decoder') and hasattr(chat.decoder, 'half'):
+                                chat.decoder = chat.decoder.half()
+                            if hasattr(chat, 'model') and hasattr(chat.model, 'half'):
+                                chat.model = chat.model.half()
+                        except Exception:
+                            pass
                     self._chat = chat
                     self._init_voice_embeddings()
+                    self._clear_gpu_cache()
             return self._chat
         except Exception as exc:
             self._model_error = (
@@ -544,7 +617,6 @@ class TTSService:
             raise RuntimeError(self._model_error) from exc
 
     def _init_voice_embeddings(self) -> None:
-        """Generate and cache speaker embeddings for all voices on first run."""
         for voice in self.voices:
             emb_path = self.speakers_dir / f"{voice['id']}.txt"
             if emb_path.exists():
@@ -553,31 +625,25 @@ class TTSService:
             emb_path.write_text(spk_emb, encoding="utf-8")
 
     def _get_speaker_embedding(self, voice_id: str) -> str:
-        """Load cached speaker embedding string, falling back to on-the-fly generation."""
         if voice_id in self._speaker_cache:
             return self._speaker_cache[voice_id]
-
         emb_path = self.speakers_dir / f"{voice_id}.txt"
         if emb_path.exists():
             spk_emb = emb_path.read_text(encoding="utf-8")
         else:
             spk_emb = self._chat.sample_random_speaker()
             emb_path.write_text(spk_emb, encoding="utf-8")
-
         self._speaker_cache[voice_id] = spk_emb
         return spk_emb
 
     @staticmethod
     def detect_emotion(text: str) -> str:
-        """Simple keyword-based emotion detection for Chinese text."""
         happy_kw = ["开心", "高兴", "快乐", "欢喜", "愉快", "兴奋", "惊喜", "美好", "棒", "赞", "哈哈", "嘻嘻", "笑了"]
         sad_kw = ["伤心", "难过", "悲伤", "悲哀", "流泪", "痛苦", "失落", "忧愁", "可怜", "呜呜", "哭了"]
         angry_kw = ["生气", "可恶", "该死", "混蛋", "滚开", "烦躁", "暴躁", "气死", "气人", "愤怒", "讨厌", "恨"]
         surprise_kw = ["惊讶", "震惊", "诧异", "竟然", "居然", "没想到", "天哪", "哇", "啊呀"]
-
         text_lower = text
         scores = {"neutral": 0, "happy": 0, "sad": 0, "angry": 0, "surprise": 0}
-
         for kw in happy_kw:
             scores["happy"] += text_lower.count(kw) * 2
         for kw in surprise_kw:
@@ -586,28 +652,21 @@ class TTSService:
             scores["sad"] += text_lower.count(kw) * 2
         for kw in angry_kw:
             scores["angry"] += text_lower.count(kw) * 2
-
-        # Boost happy if exclamation marks
         scores["happy"] += text_lower.count("！") + text_lower.count("!")
         scores["surprise"] += text_lower.count("？") + text_lower.count("?")
-
         best = max(scores, key=scores.get)
         return best if scores[best] > 0 else "neutral"
 
     def _tts_params(self, voice_id: str, rate: float, emotion: str):
-        """Build ChatTTS inference params for a voice/emotion combo."""
         import ChatTTS as CT
-
         voice_seed = 42
         for v in self.voices:
             if v["id"] == voice_id:
                 voice_seed = v["seed"]
                 break
-
         emotion_cfg = self.emotions.get(emotion, self.emotions["neutral"])
         spk_emb = self._get_speaker_embedding(voice_id)
         speed_val = max(1, min(9, round(rate * 5)))
-
         params_refine_text = CT.Chat.RefineTextParams(prompt=emotion_cfg["prompt"])
         params_infer_code = CT.Chat.InferCodeParams(
             spk_emb=spk_emb,
@@ -620,19 +679,17 @@ class TTSService:
         return params_refine_text, params_infer_code
 
     def _synthesize_one(self, text: str, voice_id: str, rate: float, emotion: str) -> dict[str, Any]:
-        """Synthesize a single text and cache the result."""
         digest = hashlib.sha256(f"{voice_id}|{rate}|{emotion}|{text}".encode("utf-8")).hexdigest()[:24]
         audio_path = self.cache_dir / f"{digest}.wav"
         if audio_path.exists():
             return {"cached": True, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
-
         chat = self._load_model()
         import soundfile as sf
-
         prp, pic = self._tts_params(voice_id, rate, emotion)
         with self._lock:
             wavs = chat.infer([text], params_refine_text=prp, params_infer_code=pic, use_decoder=True)
         sf.write(str(audio_path), wavs[0], 24000)
+        self._clear_gpu_cache()
         return {"cached": False, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
 
     def synthesize(self, text: str, voice_id: str, rate: float = 1.0, emotion: str | None = None) -> dict[str, Any]:
@@ -646,48 +703,81 @@ class TTSService:
         return {**result, "sentences": sentences, "voiceId": voice_id}
 
     def synthesize_batch(self, texts: list[str], voice_id: str, rate: float = 1.0, emotion: str | None = None) -> list[dict[str, Any]]:
-        """Batch-synthesize multiple texts in one ChatTTS infer call for GPU efficiency."""
         texts = [t.strip() for t in texts if t.strip()]
         if not texts:
             return []
         voice_id = voice_id or "qinglang_male"
-
-        results = []
-        uncached_texts: list[str] = []
-        uncached_indices: list[int] = []
-
+        results: list[dict[str, Any]] = [None] * len(texts)
+        uncached: list[tuple[int, str, str, str]] = []
         for i, text in enumerate(texts):
             emo = emotion or self.detect_emotion(text)
             digest = hashlib.sha256(f"{voice_id}|{rate}|{emo}|{text}".encode("utf-8")).hexdigest()[:24]
             audio_path = self.cache_dir / f"{digest}.wav"
             if audio_path.exists():
-                results.append({"index": i, "cached": True, "audioUrl": f"/api/tts/audio/{audio_path.name}"})
+                results[i] = {"index": i, "cached": True, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
             else:
-                results.append({"index": i, "cached": False, "text": text, "emotion": emo, "digest": digest})
-                uncached_texts.append(text)
-                uncached_indices.append(i)
-
-        if uncached_texts:
-            chat = self._load_model()
-            import soundfile as sf
-
-            # Group by emotion for efficient batch processing
-            # For simplicity, use the first text's emotion for the whole batch
-            batch_emo = results[uncached_indices[0]].get("emotion", "neutral")
+                uncached.append((i, text, emo, digest))
+        if not uncached:
+            return results
+        chat = self._load_model()
+        import soundfile as sf
+        sub_batch_size = self._maybe_throttle_batch(len(uncached))
+        for chunk_start in range(0, len(uncached), sub_batch_size):
+            chunk = uncached[chunk_start:chunk_start + sub_batch_size]
+            chunk_texts = [item[1] for item in chunk]
+            batch_emo = chunk[0][2]
             prp, pic = self._tts_params(voice_id, rate, batch_emo)
             with self._lock:
-                wavs = chat.infer(uncached_texts, params_refine_text=prp, params_infer_code=pic, use_decoder=True, split_text=False)
-
-            for idx, wav in zip(uncached_indices, wavs):
-                audio_path = self.cache_dir / f"{results[idx]['digest']}.wav"
+                wavs = chat.infer(chunk_texts, params_refine_text=prp, params_infer_code=pic, use_decoder=True, split_text=False)
+            for (orig_idx, text, emo, digest), wav in zip(chunk, wavs):
+                audio_path = self.cache_dir / f"{digest}.wav"
                 sf.write(str(audio_path), wav, 24000)
-                results[idx] = {"index": idx, "cached": False, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
+                results[orig_idx] = {"index": orig_idx, "cached": False, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
+            self._clear_gpu_cache()
+        return results
 
+
+class TranslationService:
+    """Real-time text translation using deep-translator (free Google Translate API)."""
+
+    def __init__(self):
+        self._cache: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def translate(self, text: str, target: str = "zh-CN", source: str = "auto") -> dict[str, Any]:
+        if not text or not text.strip():
+            return {"text": "", "source": source, "target": target}
+
+        cache_key = f"{source}|{target}|{text}"
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached:
+                return {"text": cached, "source": source, "target": target, "cached": True}
+
+        try:
+            from deep_translator import GoogleTranslator
+            translator = GoogleTranslator(source=source, target=target)
+            result = translator.translate(text)
+            translated = result or ""
+            with self._lock:
+                self._cache[cache_key] = translated
+            return {"text": translated, "source": source, "target": target, "cached": False}
+        except Exception as exc:
+            raise RuntimeError(f"Translation failed: {exc}")
+
+    def translate_batch(self, texts: list[str], target: str = "zh-CN", source: str = "auto") -> list[dict[str, Any]]:
+        results = []
+        for text in texts:
+            try:
+                results.append(self.translate(text, target, source))
+            except Exception:
+                results.append({"text": "", "source": source, "target": target, "error": True})
         return results
 
 
 novel_manager = NovelManager(NOVELS_DIR)
 tts_service = TTSService(TTS_CACHE_DIR)
+translation_service = TranslationService()
 
 
 @app.route("/")
@@ -772,6 +862,14 @@ def api_delete_novel(novel_id: str):
     return jsonify({"error": "novel not found"}), 404
 
 
+@app.route("/api/novels/<novel_id>/meta", methods=["PUT"])
+def api_update_novel_meta(novel_id: str):
+    data = request.get_json(silent=True) or {}
+    if novel_manager.update_meta(novel_id, data):
+        return jsonify({"success": True, "novel": novel_manager.get(novel_id)})
+    return jsonify({"error": "novel not found"}), 404
+
+
 @app.route("/api/novels/<novel_id>/progress", methods=["PUT"])
 def api_update_progress(novel_id: str):
     data = request.get_json(silent=True) or {}
@@ -836,6 +934,60 @@ def api_tts_synthesize_batch():
 @app.route("/api/tts/audio/<path:filename>", methods=["GET"])
 def api_tts_audio(filename: str):
     return send_from_directory(str(TTS_CACHE_DIR), filename)
+
+
+@app.route("/api/tts/gpu-settings", methods=["GET"])
+def api_tts_gpu_settings():
+    return jsonify({"gpu": tts_service.gpu, "cudaAvailable": tts_service._cuda_available()})
+
+
+@app.route("/api/tts/gpu-settings", methods=["PUT"])
+def api_tts_update_gpu_settings():
+    data = request.get_json(silent=True) or {}
+    settings = tts_service.update_gpu_settings(data)
+    return jsonify({"success": True, "gpu": settings})
+
+
+@app.route("/api/translate", methods=["POST"])
+def api_translate():
+    """Translate text with auto-detect source language."""
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    target = data.get("target", "zh-CN")
+    source = data.get("source", "auto")
+    try:
+        if data.get("batch"):
+            texts = data.get("texts", [text])
+            results = translation_service.translate_batch(texts, target, source)
+            return jsonify({"results": results, "count": len(results)})
+        result = translation_service.translate(text, target, source)
+        return jsonify(result)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        return jsonify({"error": f"Translation failed: {exc}"}), 500
+
+
+@app.route("/api/languages", methods=["GET"])
+def api_languages():
+    """Return supported target languages for translation."""
+    return jsonify({
+        "languages": [
+            {"code": "zh-CN", "name": "简体中文"},
+            {"code": "zh-TW", "name": "繁体中文"},
+            {"code": "en", "name": "English"},
+            {"code": "ja", "name": "日本語"},
+            {"code": "ko", "name": "한국어"},
+            {"code": "fr", "name": "Français"},
+            {"code": "de", "name": "Deutsch"},
+            {"code": "es", "name": "Español"},
+            {"code": "ru", "name": "Русский"},
+            {"code": "th", "name": "ไทย"},
+            {"code": "vi", "name": "Tiếng Việt"},
+        ]
+    })
 
 
 @app.route("/api/settings", methods=["GET"])

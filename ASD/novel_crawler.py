@@ -148,6 +148,7 @@ class BiqugeStyleParser(BaseParser):
         'biquge', 'xbiquge', 'qubook', '69shu', '69xsw',
         'shuquge', 'uuks', 'bqg', 'qula', 'hetushu',
         'lingdian', 'quanshu', 'bxwx', 'zwdu',
+        'biqubao', 'bqgka', 'bqg2', 'bqg99',
     ]
 
     def get_title(self, soup, url):

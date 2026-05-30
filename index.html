@@ -23,7 +23,7 @@
   </div>
   <div class="bookshelf-grid" id="bookshelf-grid"></div>
   <div class="bookshelf-actions">
-    <a class="web-link-btn" href="https://www.biquge.com" target="_blank" title="打开笔趣阁">网</a>
+    <a class="web-link-btn" href="https://www.xbiquge.la" target="_blank" title="打开小说网站 - 点击选择来源">源</a>
     <button class="fab-btn" id="btn-import" title="导入小说">+</button>
   </div>
 </div>
@@ -53,6 +53,7 @@
       <button class="nav-btn" id="nav-night" aria-label="夜间">☾<span>夜间</span></button>
       <button class="nav-btn" id="nav-settings" aria-label="设置">文<span>设置</span></button>
       <button class="nav-btn" id="nav-voices" aria-label="语音">听<span>语音</span></button>
+      <button class="nav-btn" id="nav-translate" aria-label="翻译">译<span>翻译</span></button>
     </nav>
   </footer>
 
@@ -100,6 +101,30 @@
         <button class="effect-option" data-effect="cover"><span class="effect-icon">▱</span>覆盖翻页</button>
         <button class="effect-option" data-effect="simulation"><span class="effect-icon">◜</span>仿真翻页</button>
         <button class="effect-option active" data-effect="updown"><span class="effect-icon">▤</span>上下翻页</button>
+      </div>
+      <div style="border-top:1px solid var(--divider-color);margin:8px 0"></div>
+      <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:8px">⚙ GPU / TTS 加速</div>
+      <div class="setting-row" id="gpu-batch-row" style="display:none">
+        <span class="setting-label">批量合成</span>
+        <input type="range" class="setting-slider" id="gpu-max-batch" min="1" max="20" value="5">
+        <span class="setting-link" id="gpu-batch-display">5句</span>
+      </div>
+      <div class="setting-row" id="gpu-half-row" style="display:none">
+        <span class="setting-label">半精度 (省显存)</span>
+        <label style="flex:1;display:flex;justify-content:flex-end">
+          <input type="checkbox" id="gpu-half" checked style="width:18px;height:18px">
+        </label>
+      </div>
+      <div class="setting-row" id="gpu-cache-row" style="display:none">
+        <span class="setting-label">每批清理缓存</span>
+        <label style="flex:1;display:flex;justify-content:flex-end">
+          <input type="checkbox" id="gpu-clear-cache" checked style="width:18px;height:18px">
+        </label>
+      </div>
+      <div class="setting-row" id="gpu-vram-row" style="display:none">
+        <span class="setting-label">显存阈值</span>
+        <input type="range" class="setting-slider" id="gpu-max-vram" min="50" max="95" value="80">
+        <span class="setting-link" id="gpu-vram-display">80%</span>
       </div>
     </div>
     <div class="settings-footer">
@@ -152,7 +177,18 @@
       <div class="import-divider">或</div>
       <div class="import-section">
         <h4>从 URL 自动爬取</h4>
-        <input type="url" id="crawl-url" placeholder="小说目录页 URL" class="import-input">
+        <select id="crawl-source" class="import-input" style="margin-bottom:4px">
+          <option value="auto">自动检测网站类型</option>
+          <option value="xbiquge">笔趣阁风格 (xbiquge.la / biquge.com 等)</option>
+          <option value="69shu">69书吧 (69shu.com)</option>
+          <option value="syosetu">Syosetu 日本小说 (syosetu.com)</option>
+          <option value="biqubao">笔趣阁宝 (biqubao.com)</option>
+        </select>
+        <input type="url" id="crawl-url" placeholder="小说目录页 URL（支持多家网站）" class="import-input">
+        <div style="font-size:12px;color:var(--text-secondary);margin:-4px 0 8px 4px">
+          支持：xbiquge.la、69shu.com、biqubao.com、syosetu.com
+          <a href="https://www.xbiquge.la" target="_blank" style="color:var(--text-link);margin-left:4px">打开 xbiquge.la ›</a>
+        </div>
         <button class="import-submit" id="crawl-submit">开始爬取</button>
         <div class="crawl-progress" id="crawl-progress" style="display:none">
           <span id="crawl-progress-text">正在导入目录并预抓100章...</span>
@@ -165,8 +201,66 @@
 <div class="modal-overlay" id="menu-modal">
   <div class="menu-panel">
     <button class="menu-item" id="menu-export">导出 TXT</button>
+    <button class="menu-item" id="menu-edit">编辑信息</button>
     <button class="menu-item" id="menu-info">关于</button>
     <button class="menu-item danger" id="menu-delete">删除小说</button>
+  </div>
+</div>
+
+<div class="modal-overlay sheet-overlay" id="translate-modal">
+  <div class="settings-panel">
+    <div class="settings-header">
+      <h3>实时翻译</h3>
+      <button class="icon-btn close-btn" id="translate-close">×</button>
+    </div>
+    <div class="settings-body">
+      <div class="setting-row">
+        <span class="setting-label">译为目标语言</span>
+        <select id="translate-target" class="import-input" style="flex:1;margin:0;width:auto">
+          <option value="zh-CN">简体中文</option>
+          <option value="zh-TW">繁体中文</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+        </select>
+      </div>
+      <div id="translate-result" style="padding:12px 0;font-size:14px;line-height:1.8;max-height:300px;overflow-y:auto;color:var(--text-secondary)">
+        点击「翻译本章」按钮开始翻译
+      </div>
+      <button class="import-submit" id="translate-chapter-btn" style="margin-bottom:8px">翻译本章</button>
+      <label style="font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="translate-auto"> 切换章节时自动翻译
+      </label>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="edit-modal">
+  <div class="import-panel">
+    <div class="import-header">
+      <h3>编辑书籍信息</h3>
+      <button class="icon-btn close-btn" id="edit-close">×</button>
+    </div>
+    <div class="import-body">
+      <input type="text" id="edit-title" placeholder="书籍名称" class="import-input">
+      <input type="text" id="edit-author" placeholder="作者" class="import-input">
+      <div style="margin:12px 0">
+        <label style="font-size:13px;color:var(--text-secondary);display:block;margin-bottom:6px">封面颜色</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap" id="edit-colors">
+          <button class="color-swatch" data-color="#5A7A9A" style="background:#5A7A9A;width:36px;height:36px;border-radius:50%"></button>
+          <button class="color-swatch" data-color="#8B5E3C" style="background:#8B5E3C;width:36px;height:36px;border-radius:50%"></button>
+          <button class="color-swatch" data-color="#6B8E6B" style="background:#6B8E6B;width:36px;height:36px;border-radius:50%"></button>
+          <button class="color-swatch" data-color="#A0526D" style="background:#A0526D;width:36px;height:36px;border-radius:50%"></button>
+          <button class="color-swatch" data-color="#B8860B" style="background:#B8860B;width:36px;height:36px;border-radius:50%"></button>
+          <button class="color-swatch" data-color="#4A6FA5" style="background:#4A6FA5;width:36px;height:36px;border-radius:50%"></button>
+          <button class="color-swatch" data-color="#8B7D6B" style="background:#8B7D6B;width:36px;height:36px;border-radius:50%"></button>
+          <button class="color-swatch" data-color="#C4724A" style="background:#C4724A;width:36px;height:36px;border-radius:50%"></button>
+        </div>
+      </div>
+      <button class="import-submit" id="edit-submit">保存修改</button>
+    </div>
   </div>
 </div>
 
