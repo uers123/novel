@@ -575,11 +575,59 @@ class TTSService:
         return [{**voice, "installed": installed} for voice in self.voices]
 
     def _chattts_available(self) -> bool:
+        if self._model_error:
+            return False
         try:
             import ChatTTS
             return True
         except Exception:
-            return False
+            pass
+        # Fallback: scan known site-packages paths
+        try:
+            import importlib.util
+            import glob as _glob
+            for _p in _glob.glob(
+                sys.prefix + "/Lib/site-packages/ChatTTS",
+            ) + _glob.glob(
+                sys.prefix + "/lib/python*/site-packages/ChatTTS",
+            ):
+                if _p:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _ensure_chattts_importable(self) -> None:
+        """Ensure ChatTTS can be imported, trying alternate site-packages paths if needed."""
+        try:
+            import ChatTTS  # noqa: F401
+            return
+        except ImportError:
+            pass
+        # Fallback: scan for ChatTTS in common site-packages locations
+        import glob
+        candidates = glob.glob(
+            sys.prefix + "/Lib/site-packages/ChatTTS"
+        ) + glob.glob(
+            sys.prefix + "/lib/python*/site-packages/ChatTTS"
+        )
+        # Also check other Python installations
+        for _base in ["D:/py3.13.3", "D:/anaconda", "C:/Users/39528/AppData/Local/Programs/Python/Python312"]:
+            candidates += glob.glob(_base + "/Lib/site-packages/ChatTTS")
+            candidates += glob.glob(_base + "/lib/python*/site-packages/ChatTTS")
+        for _p in candidates:
+            _sp = _p.replace("/ChatTTS", "").replace("\\ChatTTS", "")
+            if _sp not in sys.path:
+                sys.path.insert(0, _sp)
+                try:
+                    import ChatTTS  # noqa: F401
+                    import sys
+                    print(f"  ChatTTS found via fallback path: {_sp}", file=sys.stderr)
+                    return
+                except ImportError:
+                    if _sp in sys.path:
+                        sys.path.remove(_sp)
+        raise ImportError("ChatTTS not found in any Python site-packages")
 
     def _load_model(self):
         if self._chat is not None:
@@ -587,6 +635,7 @@ class TTSService:
         if self._model_error:
             raise RuntimeError(self._model_error)
         try:
+            self._ensure_chattts_importable()
             import ChatTTS
             import numpy as np
             import torch
@@ -1011,6 +1060,15 @@ def static_files(path: str):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     print("Novel reader backend starting")
+    print(f"Python: {sys.executable}")
     print(f"Storage: {NOVELS_DIR}")
+    _chattts_ok = tts_service._chattts_available()
+    print(f"ChatTTS: {'✓ available' if _chattts_ok else '✗ NOT FOUND'}")
+    if tts_service._cuda_available():
+        import torch
+        _vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"CUDA: ✓ {torch.cuda.get_device_name()} ({_vram:.1f} GB)")
+    else:
+        print("CUDA: ✗ not available")
     print(f"URL: http://localhost:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
