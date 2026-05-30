@@ -5,11 +5,11 @@
 
 /* ============ 主题变量（默认白天模式） ============ */
 :root {
-  --bg-page: #F5F0EB;
+  --bg-page: #F6F3EC;
   --bg-card: #FFFFFF;
-  --bg-reader: #F9F7F4;
-  --bg-header: rgba(249, 247, 244, 0.97);
-  --bg-footer: rgba(249, 247, 244, 0.97);
+  --bg-reader: #F6F3EC;
+  --bg-header: rgba(246, 243, 236, 0.97);
+  --bg-footer: rgba(246, 243, 236, 0.97);
   --bg-modal: rgba(0, 0, 0, 0.5);
   --bg-panel: #FFFFFF;
   --bg-slider-track: #DDD;

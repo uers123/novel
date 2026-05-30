@@ -1,531 +1,880 @@
 """
-app.py - AI 有声小说播放器后端
+Flask backend for the novel reader.
 
-提供:
-  - 小说导入 (上传TXT / 爬取URL)
-  - 章节管理
-  - 翻译 (Google翻译 / LLM接口)
-  - 设置持久化
-  - 静态文件服务 (前端 SPA)
+Features:
+- TXT import and URL catalog import.
+- Lazy chapter crawling with background prefetch.
+- Chapter progress and reader settings persistence.
+- Local TTS service adapter, designed for MeloTTS.
+- Local LLM translation task adapter, designed for the nocle GGUF model.
 """
 
+from __future__ import annotations
+
+import hashlib
+import json
+import math
 import os
 import re
-import sys
-import json
-import uuid
 import shutil
+import sys
 import threading
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-# 修复 Windows 终端编码问题
-if sys.platform == 'win32':
+from flask import Flask, jsonify, request, send_from_directory
+
+try:
+    from flask_cors import CORS
+except ImportError:  # Keep the app importable before dependencies are installed.
+    def CORS(_app: Flask) -> None:
+        return None
+
+
+if sys.platform == "win32":
     import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
-# ===================== 路径配置 =====================
 
 BASE_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = BASE_DIR.parent  # 项目根目录
+PROJECT_DIR = BASE_DIR.parent
 NOVELS_DIR = BASE_DIR / "novels"
 SETTINGS_FILE = BASE_DIR / "settings.json"
+TTS_CACHE_DIR = BASE_DIR / "tts_cache"
+NOCLE_DIR = PROJECT_DIR / "nocle"
+NOCLE_MODELS_DIR = NOCLE_DIR / "models"
 
-# ===================== Flask 初始化 =====================
+DEFAULT_SETTINGS = {
+    "theme": "day",
+    "fontSize": 20,
+    "lineHeight": 2.0,
+    "bgColor": "#F6F3EC",
+    "pageEffect": "updown",
+    "brightness": 100,
+    "voiceId": "qinglang_male",
+    "autoRead": False,
+}
 
 app = Flask(__name__, static_folder=str(PROJECT_DIR), static_url_path="")
 CORS(app)
 
-# ===================== 数据模型 =====================
+
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+
+def split_sentences(text: str) -> list[str]:
+    pieces = re.split(r"(?<=[。！？!?；;])\s*|\n+", text or "")
+    sentences = [p.strip() for p in pieces if len(p.strip()) > 0]
+    if not sentences and text:
+        sentences = [text.strip()]
+    return sentences
+
+
+def chunk_text(text: str, max_chars: int = 2200) -> list[str]:
+    paragraphs = [p for p in re.split(r"\n{2,}", text or "") if p.strip()]
+    chunks: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        if len(current) + len(paragraph) + 2 <= max_chars:
+            current = f"{current}\n\n{paragraph}".strip()
+        else:
+            if current:
+                chunks.append(current)
+            if len(paragraph) <= max_chars:
+                current = paragraph
+            else:
+                for i in range(0, len(paragraph), max_chars):
+                    chunks.append(paragraph[i : i + max_chars])
+                current = ""
+    if current:
+        chunks.append(current)
+    return chunks or ([text] if text else [])
 
 
 class NovelManager:
-    """小说管理器"""
-
-    def __init__(self, storage_dir):
-        self.storage_dir = Path(storage_dir)
+    def __init__(self, storage_dir: Path):
+        self.storage_dir = storage_dir
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.index_file = self.storage_dir / "_index.json"
-        self._index = self._load_index()
+        self._index: dict[str, dict[str, Any]] = read_json(self.index_file, {})
+        self._lock = threading.RLock()
 
-    def _load_index(self):
-        if self.index_file.exists():
-            with open(self.index_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return {}
+    def _save_index(self) -> None:
+        write_json(self.index_file, self._index)
 
-    def _save_index(self):
-        with open(self.index_file, "w", encoding="utf-8") as f:
-            json.dump(self._index, f, ensure_ascii=False, indent=2)
-
-    def _novel_path(self, novel_id):
+    def _novel_path(self, novel_id: str) -> Path:
         return self.storage_dir / novel_id
 
-    def list_all(self):
-        novels = []
-        for nid, info in self._index.items():
-            novels.append({
-                "id": nid,
-                "title": info.get("title", "未知"),
-                "author": info.get("author", ""),
-                "chapterCount": info.get("chapterCount", 0),
-                "progress": info.get("progress", 0),
-                "importedAt": info.get("importedAt", ""),
-                "source": info.get("source", ""),
-            })
-        novels.sort(key=lambda x: x["importedAt"], reverse=True)
-        return novels
+    def _chapters_file(self, novel_id: str) -> Path:
+        return self._novel_path(novel_id) / "chapters.json"
 
-    def get(self, novel_id):
-        info = self._index.get(novel_id)
-        if not info:
-            return None
+    def _crawl_file(self, novel_id: str) -> Path:
+        return self._novel_path(novel_id) / "crawl_status.json"
 
-        npath = self._novel_path(novel_id)
-        chapters_file = npath / "chapters.json"
+    def _read_chapters(self, novel_id: str) -> list[dict[str, Any]]:
+        return read_json(self._chapters_file(novel_id), [])
 
-        chapters = []
-        if chapters_file.exists():
-            with open(chapters_file, "r", encoding="utf-8") as f:
-                chapters = json.load(f)
+    def _write_chapters(self, novel_id: str, chapters: list[dict[str, Any]]) -> None:
+        write_json(self._chapters_file(novel_id), chapters)
 
-        return {
-            "id": novel_id,
-            "title": info.get("title", "未知"),
-            "author": info.get("author", ""),
-            "description": info.get("description", ""),
-            "chapterCount": len(chapters),
-            "progress": info.get("progress", 0),
-            "source": info.get("source", ""),
-            "importedAt": info.get("importedAt", ""),
-            "chapters": chapters,
-        }
-
-    def get_chapter(self, novel_id, chapter_index):
-        info = self._index.get(novel_id)
-        if not info:
-            return None
-
-        npath = self._novel_path(novel_id)
-        chapter_file = npath / f"chapter_{chapter_index}.txt"
-
-        if not chapter_file.exists():
-            return None
-
-        with open(chapter_file, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        # 获取章节标题
-        chapters_file = npath / "chapters.json"
-        title = f"第{int(chapter_index) + 1}章"
-        if chapters_file.exists():
-            with open(chapters_file, "r", encoding="utf-8") as f:
-                ch_list = json.load(f)
-                idx = int(chapter_index)
-                if 0 <= idx < len(ch_list):
-                    title = ch_list[idx].get("title", title)
-
-        return {
-            "novelId": novel_id,
-            "chapterIndex": int(chapter_index),
-            "title": title,
-            "content": content,
-        }
-
-    def import_from_txt(self, file_path, title=None, author="", source=""):
-        """从TXT文件导入小说"""
-        novel_id = str(uuid.uuid4())[:8]
-        npath = self._novel_path(novel_id)
-        npath.mkdir(parents=True, exist_ok=True)
-
-        # 读取文件
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
-
-        # 自动检测标题
-        if not title:
-            title = Path(file_path).stem
-            title = re.sub(r'[_-]', ' ', title)
-
-        # 分章逻辑：按行首章节标记分割
-        chapter_rx = re.compile(
-            r'^[ \t]*'
-            r'(第[一二三四五六七八九十百千万0-9]+[章节回部集卷篇][^\n]*'
-            r'|第\d+[章节回部集卷篇][^\n]*'
-            r'|序章[^\n]*|楔子[^\n]*|尾声[^\n]*|后记[^\n]*|番外[^\n]*|前言[^\n]*)'
-            r'\s*$',
-            re.MULTILINE
+    def _read_crawl_status(self, novel_id: str) -> dict[str, Any]:
+        chapters = self._read_chapters(novel_id)
+        return read_json(
+            self._crawl_file(novel_id),
+            {
+                "novelId": novel_id,
+                "total": len(chapters),
+                "cached": 0,
+                "prefetchTarget": 0,
+                "prefetched": 0,
+                "inProgress": False,
+                "failed": [],
+                "updatedAt": None,
+            },
         )
 
-        matches = list(chapter_rx.finditer(text))
-        chapters = []
-        chapter_texts = []
+    def _write_crawl_status(self, novel_id: str, status: dict[str, Any]) -> None:
+        status["updatedAt"] = datetime.now().isoformat()
+        write_json(self._crawl_file(novel_id), status)
 
-        if matches:
-            # 处理首个标题前的引言部分
-            if matches[0].start() > 0:
-                lead = text[:matches[0].start()].strip()
-                if lead:
-                    chapters.append("前言")
-                    chapter_texts.append(lead)
+    def list_all(self) -> list[dict[str, Any]]:
+        with self._lock:
+            novels = []
+            for novel_id, info in self._index.items():
+                novels.append(
+                    {
+                        "id": novel_id,
+                        "title": info.get("title", "Untitled"),
+                        "author": info.get("author", ""),
+                        "chapterCount": info.get("chapterCount", 0),
+                        "progress": info.get("progress", 0),
+                        "importedAt": info.get("importedAt", ""),
+                        "source": info.get("source", ""),
+                        "sourceType": info.get("sourceType", "txt"),
+                    }
+                )
+            novels.sort(key=lambda item: item["importedAt"], reverse=True)
+            return novels
 
-            for i, m in enumerate(matches):
-                ch_title = m.group(1).strip()
-                start = m.end()
-                end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-                content = text[start:end].strip()
-                chapters.append(ch_title)
-                chapter_texts.append(content)
-        else:
-            # 无章节标记，按段落分
-            paragraphs = text.split('\n\n')
-            chunk_size = min(50, max(1, len(paragraphs) // 5 + 1))
-            for i in range(0, len(paragraphs), chunk_size):
-                chunk = '\n\n'.join(paragraphs[i:i + chunk_size]).strip()
-                if chunk:
-                    chapters.append(f"第{len(chapters) + 1}章")
-                    chapter_texts.append(chunk)
+    def get(self, novel_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            info = self._index.get(novel_id)
+            if not info:
+                return None
+            chapters = self._read_chapters(novel_id)
+            return {
+                "id": novel_id,
+                "title": info.get("title", "Untitled"),
+                "author": info.get("author", ""),
+                "description": info.get("description", ""),
+                "chapterCount": len(chapters),
+                "progress": info.get("progress", 0),
+                "source": info.get("source", ""),
+                "sourceType": info.get("sourceType", "txt"),
+                "importedAt": info.get("importedAt", ""),
+                "chapters": chapters,
+            }
 
-        if not chapter_texts:
-            chapters.append("正文")
-            chapter_texts.append(text.strip())
+    def _chapter_path(self, novel_id: str, chapter_index: int) -> Path:
+        return self._novel_path(novel_id) / f"chapter_{chapter_index}.txt"
 
-        # 保存章节索引
-        ch_index = []
-        for i, ch_title in enumerate(chapters):
-            ch_index.append({"index": i, "title": ch_title})
-        with open(npath / "chapters.json", "w", encoding="utf-8") as f:
-            json.dump(ch_index, f, ensure_ascii=False, indent=2)
-
-        # 保存每章内容
-        for i, content in enumerate(chapter_texts):
-            with open(npath / f"chapter_{i}.txt", "w", encoding="utf-8") as f:
-                f.write(content.strip())
-
-        # 保存元数据
-        meta = {
-            "title": title.strip(),
-            "author": author.strip(),
-            "source": source,
-            "chapterCount": len(chapters),
-            "progress": 0,
-            "importedAt": datetime.now().isoformat(),
-        }
-        with open(npath / "meta.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-
-        # 更新索引
-        self._index[novel_id] = meta
-        self._save_index()
-
-        return {"id": novel_id, **meta}
-
-    def import_from_crawl(self, url, title=None):
-        """爬取并导入小说"""
-        # 导入爬虫模块
-        import sys as _sys
-        crawler_path = str(Path(__file__).resolve().parent.parent / "ASD")
-        if crawler_path not in _sys.path:
-            _sys.path.insert(0, crawler_path)
-
-        from novel_crawler import NovelCrawler
-
-        crawler = NovelCrawler()
-        success = crawler.fetch_novel_info(url)
-        if not success:
-            raise ValueError("无法解析该URL，请检查链接是否正确")
-
-        title = title or crawler.novel_title
-
-        # 下载所有章节
-        output_dir = crawler.download_all()
-
-        # 从下载结果导入
-        txt_file = Path(output_dir) / f"{crawler.novel_title}.txt"
-        if txt_file.exists():
-            return self.import_from_txt(
-                str(txt_file),
-                title=title,
-                author=crawler.novel_author,
-                source=url,
-            )
-        raise ValueError("爬取成功但未找到结果文件")
-
-    def delete(self, novel_id):
+    def get_chapter(self, novel_id: str, chapter_index: int) -> dict[str, Any] | None:
         if novel_id not in self._index:
-            return False
-        npath = self._novel_path(novel_id)
-        if npath.exists():
-            shutil.rmtree(npath)
-        del self._index[novel_id]
-        self._save_index()
-        return True
-
-    def update_progress(self, novel_id, chapter_index):
-        if novel_id in self._index:
-            self._index[novel_id]["progress"] = chapter_index
-            self._save_index()
-
-
-novel_manager = NovelManager(NOVELS_DIR)
-
-
-# ===================== 翻译引擎 =====================
-
-
-class Translator:
-    """翻译引擎"""
-
-    def __init__(self):
-        self._translator = None
-        self._lock = threading.Lock()
-
-    def _get_google_translator(self):
-        try:
-            from googletrans import Translator as GTranslator
-            return GTranslator()
-        except ImportError:
             return None
 
-    def translate(self, text, source="auto", target="zh-cn"):
-        """翻译文本"""
-        if not text or len(text.strip()) == 0:
-            return ""
+        chapter_path = self._chapter_path(novel_id, chapter_index)
+        if not chapter_path.exists():
+            if not self._crawl_chapter(novel_id, chapter_index):
+                return None
 
-        # Google 翻译 (免费)
-        try:
-            tr = self._get_google_translator()
-            if tr:
-                result = tr.translate(text[:5000], src=source, dest=target)
-                return result.text
-        except Exception as e:
-            return f"[翻译服务暂不可用: {e}]\n\n{text[:2000]}"
+        chapters = self._read_chapters(novel_id)
+        title = f"第{chapter_index + 1}章"
+        if 0 <= chapter_index < len(chapters):
+            title = chapters[chapter_index].get("title", title)
 
-        return text[:2000]
-
-    def translate_chapter(self, novel_id, chapter_index, source="auto", target="zh-cn"):
-        """翻译单个章节"""
-        chapter = novel_manager.get_chapter(novel_id, chapter_index)
-        if not chapter:
-            return None
-
-        content = chapter["content"]
-        translated = self.translate(content, source, target)
-
-        # 缓存翻译结果
-        npath = novel_manager._novel_path(novel_id)
-        trans_dir = npath / "translations"
-        trans_dir.mkdir(exist_ok=True)
-        trans_file = trans_dir / f"chapter_{chapter_index}_{target}.txt"
-        with open(trans_file, "w", encoding="utf-8") as f:
-            f.write(translated)
+        with open(chapter_path, "r", encoding="utf-8") as f:
+            content = f.read()
 
         return {
             "novelId": novel_id,
             "chapterIndex": chapter_index,
-            "title": chapter["title"],
-            "original": content[:200],
-            "translated": translated,
-            "target": target,
+            "title": title,
+            "content": content,
+            "sentences": split_sentences(content),
+        }
+
+    def import_from_txt(self, file_path: str, title: str | None = None, author: str = "", source: str = "") -> dict[str, Any]:
+        novel_id = str(uuid.uuid4())[:8]
+        novel_path = self._novel_path(novel_id)
+        novel_path.mkdir(parents=True, exist_ok=True)
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        if not title:
+            title = Path(file_path).stem.replace("_", " ").replace("-", " ")
+
+        chapter_rx = re.compile(
+            r"^[ \t]*(第[一二三四五六七八九十百千万零〇0-9]+[章节卷部集篇回](?:[ \t:：、-][^\n]*)?|"
+            r"[序楔引终尾后番前][^\n]{0,20})\s*$",
+            re.MULTILINE,
+        )
+        matches = list(chapter_rx.finditer(text))
+        chapter_titles: list[str] = []
+        chapter_texts: list[str] = []
+
+        if matches:
+            if matches[0].start() > 0:
+                lead = text[: matches[0].start()].strip()
+                if lead:
+                    chapter_titles.append("前言")
+                    chapter_texts.append(lead)
+            for i, match in enumerate(matches):
+                start = match.end()
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+                chapter_titles.append(match.group(1).strip())
+                chapter_texts.append(text[start:end].strip())
+        else:
+            paragraphs = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+            if not paragraphs:
+                chapter_titles.append("正文")
+                chapter_texts.append(text.strip())
+            else:
+                chunk_size = max(1, min(50, math.ceil(len(paragraphs) / 5)))
+                for start in range(0, len(paragraphs), chunk_size):
+                    chunk = "\n\n".join(paragraphs[start : start + chunk_size]).strip()
+                    if chunk:
+                        chapter_titles.append(f"第{len(chapter_titles) + 1}章")
+                        chapter_texts.append(chunk)
+
+        chapters = []
+        for index, chapter_title in enumerate(chapter_titles):
+            content = chapter_texts[index] if index < len(chapter_texts) else ""
+            with open(self._chapter_path(novel_id, index), "w", encoding="utf-8") as f:
+                f.write(content)
+            chapters.append({"index": index, "title": chapter_title, "cached": True})
+
+        meta = {
+            "title": title.strip() if title else "Untitled",
+            "author": author.strip(),
+            "source": source,
+            "sourceType": "txt",
+            "chapterCount": len(chapters),
+            "progress": 0,
+            "importedAt": datetime.now().isoformat(),
+        }
+        write_json(novel_path / "meta.json", meta)
+        self._write_chapters(novel_id, chapters)
+        self._write_crawl_status(
+            novel_id,
+            {
+                "novelId": novel_id,
+                "total": len(chapters),
+                "cached": len(chapters),
+                "prefetchTarget": 0,
+                "prefetched": len(chapters),
+                "inProgress": False,
+                "failed": [],
+                "updatedAt": datetime.now().isoformat(),
+            },
+        )
+        with self._lock:
+            self._index[novel_id] = meta
+            self._save_index()
+        return {"id": novel_id, **meta}
+
+    def import_from_crawl(self, url: str, title: str | None = None, prefetch_chapters: int = 100) -> dict[str, Any]:
+        crawler = self._new_crawler()
+        if not crawler.fetch_novel_info(url):
+            raise ValueError("Unable to parse the catalog URL.")
+
+        novel_id = str(uuid.uuid4())[:8]
+        novel_path = self._novel_path(novel_id)
+        novel_path.mkdir(parents=True, exist_ok=True)
+
+        chapters = [
+            {"index": ch.index, "title": ch.title, "url": ch.url, "cached": False}
+            for ch in crawler.chapters
+        ]
+        meta = {
+            "title": (title or crawler.novel_title or "Untitled").strip(),
+            "author": getattr(crawler, "novel_author", ""),
+            "source": url,
+            "sourceType": "url",
+            "chapterCount": len(chapters),
+            "progress": 0,
+            "importedAt": datetime.now().isoformat(),
+        }
+        write_json(novel_path / "meta.json", meta)
+        self._write_chapters(novel_id, chapters)
+        self._write_crawl_status(
+            novel_id,
+            {
+                "novelId": novel_id,
+                "total": len(chapters),
+                "cached": 0,
+                "prefetchTarget": min(max(prefetch_chapters, 0), len(chapters)),
+                "prefetched": 0,
+                "inProgress": False,
+                "failed": [],
+                "updatedAt": datetime.now().isoformat(),
+            },
+        )
+        with self._lock:
+            self._index[novel_id] = meta
+            self._save_index()
+
+        if prefetch_chapters > 0:
+            self.prefetch_chapters(novel_id, 0, prefetch_chapters)
+
+        return {"id": novel_id, **meta}
+
+    def _new_crawler(self):
+        crawler_path = str(PROJECT_DIR / "ASD")
+        if crawler_path not in sys.path:
+            sys.path.insert(0, crawler_path)
+        from novel_crawler import NovelCrawler
+
+        return NovelCrawler()
+
+    def _crawl_chapter(self, novel_id: str, chapter_index: int) -> bool:
+        chapters = self._read_chapters(novel_id)
+        if chapter_index < 0 or chapter_index >= len(chapters):
+            return False
+        chapter = chapters[chapter_index]
+        if not chapter.get("url"):
+            return False
+
+        try:
+            crawler = self._new_crawler()
+            chapter_obj = type(
+                "ChapterRef",
+                (),
+                {"title": chapter.get("title", ""), "url": chapter.get("url", ""), "index": chapter_index},
+            )()
+            content = crawler.download_chapter(chapter_obj)
+            if not content:
+                raise ValueError("empty chapter content")
+
+            with open(self._chapter_path(novel_id, chapter_index), "w", encoding="utf-8") as f:
+                f.write(content)
+            chapter["cached"] = True
+            chapter["cachedAt"] = datetime.now().isoformat()
+            self._write_chapters(novel_id, chapters)
+            self._refresh_crawl_counts(novel_id)
+            return True
+        except Exception as exc:
+            self._mark_crawl_failed(novel_id, chapter_index, str(exc))
+            return False
+
+    def _refresh_crawl_counts(self, novel_id: str) -> dict[str, Any]:
+        chapters = self._read_chapters(novel_id)
+        status = self._read_crawl_status(novel_id)
+        status["total"] = len(chapters)
+        status["cached"] = sum(1 for ch in chapters if ch.get("cached"))
+        status["prefetched"] = status["cached"]
+        self._write_crawl_status(novel_id, status)
+        return status
+
+    def _mark_crawl_failed(self, novel_id: str, chapter_index: int, error: str) -> None:
+        status = self._read_crawl_status(novel_id)
+        failed = [item for item in status.get("failed", []) if item.get("index") != chapter_index]
+        failed.append({"index": chapter_index, "error": error, "time": datetime.now().isoformat()})
+        status["failed"] = failed
+        self._write_crawl_status(novel_id, status)
+
+    def prefetch_chapters(self, novel_id: str, start: int, limit: int) -> None:
+        def worker() -> None:
+            status = self._read_crawl_status(novel_id)
+            status["inProgress"] = True
+            status["prefetchTarget"] = min(limit, status.get("total", limit))
+            self._write_crawl_status(novel_id, status)
+            try:
+                chapters = self._read_chapters(novel_id)
+                end = min(len(chapters), start + max(0, limit))
+                for index in range(max(0, start), end):
+                    if chapters[index].get("cached"):
+                        continue
+                    self._crawl_chapter(novel_id, index)
+                    time.sleep(0.2)
+            finally:
+                status = self._refresh_crawl_counts(novel_id)
+                status["inProgress"] = False
+                self._write_crawl_status(novel_id, status)
+
+        thread = threading.Thread(target=worker, name=f"prefetch-{novel_id}", daemon=True)
+        thread.start()
+
+    def crawl_status(self, novel_id: str) -> dict[str, Any] | None:
+        if novel_id not in self._index:
+            return None
+        return self._refresh_crawl_counts(novel_id)
+
+    def delete(self, novel_id: str) -> bool:
+        with self._lock:
+            if novel_id not in self._index:
+                return False
+            novel_path = self._novel_path(novel_id)
+            if novel_path.exists():
+                shutil.rmtree(novel_path)
+            del self._index[novel_id]
+            self._save_index()
+            return True
+
+    def update_progress(self, novel_id: str, chapter_index: int) -> bool:
+        with self._lock:
+            if novel_id not in self._index:
+                return False
+            self._index[novel_id]["progress"] = int(chapter_index)
+            self._save_index()
+            return True
+
+
+class TTSService:
+    def __init__(self, cache_dir: Path):
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._model = None
+        self._model_error: str | None = None
+        self._lock = threading.Lock()
+        self.voices = [
+            {"id": "ruanmeng_female", "name": "软萌萝莉", "gender": "female", "avatar": "萝", "installed": False},
+            {"id": "child", "name": "萌娃童声", "gender": "child", "avatar": "童", "installed": False},
+            {"id": "dashu_male", "name": "深沉大叔", "gender": "male", "avatar": "叔", "installed": False},
+            {"id": "young_male", "name": "温柔少年", "gender": "male", "avatar": "少", "installed": False},
+            {"id": "qinglang_male", "name": "清朗男声", "gender": "male", "avatar": "朗", "installed": False},
+            {"id": "mature_male", "name": "成熟男声", "gender": "male", "avatar": "熟", "installed": False},
+            {"id": "gentle_female", "name": "温柔女声", "gender": "female", "avatar": "温", "installed": False},
+            {"id": "cool_female", "name": "清冷女声", "gender": "female", "avatar": "冷", "installed": False},
+        ]
+
+    def list_voices(self) -> list[dict[str, Any]]:
+        installed = self._melo_available()
+        return [{**voice, "installed": installed} for voice in self.voices]
+
+    def _melo_available(self) -> bool:
+        try:
+            import melo.api  # noqa: F401
+
+            return True
+        except Exception:
+            return False
+
+    def _load_model(self):
+        if self._model is not None:
+            return self._model
+        if self._model_error:
+            raise RuntimeError(self._model_error)
+        try:
+            from melo.api import TTS
+
+            with self._lock:
+                if self._model is None:
+                    self._model = TTS(language="ZH", device="auto")
+            return self._model
+        except Exception as exc:
+            self._model_error = (
+                "MeloTTS is not installed or failed to load. "
+                "Install and configure MeloTTS before using backend local TTS. "
+                f"Details: {exc}"
+            )
+            raise RuntimeError(self._model_error) from exc
+
+    def synthesize(self, text: str, voice_id: str, rate: float = 1.0) -> dict[str, Any]:
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("text is required")
+        voice_id = voice_id or "qinglang_male"
+        digest = hashlib.sha256(f"{voice_id}|{rate}|{text}".encode("utf-8")).hexdigest()[:24]
+        audio_path = self.cache_dir / f"{digest}.wav"
+        sentences = split_sentences(text)
+
+        if audio_path.exists():
+            return {
+                "cached": True,
+                "audioUrl": f"/api/tts/audio/{audio_path.name}",
+                "sentences": sentences,
+                "voiceId": voice_id,
+            }
+
+        model = self._load_model()
+        speaker_ids = getattr(model, "hps", None)
+        speaker_id = 0
+        try:
+            speakers = getattr(speaker_ids, "data", {}).get("spk2id", {})
+            if speakers:
+                speaker_id = next(iter(speakers.values()))
+        except Exception:
+            speaker_id = 0
+
+        model.tts_to_file(text, speaker_id, str(audio_path), speed=rate)
+        return {
+            "cached": False,
+            "audioUrl": f"/api/tts/audio/{audio_path.name}",
+            "sentences": sentences,
+            "voiceId": voice_id,
         }
 
 
-translator = Translator()
+class TranslationService:
+    def __init__(self):
+        self._llm = None
+        self._llm_error: str | None = None
+        self._lock = threading.Lock()
+        self._tasks: dict[str, dict[str, Any]] = {}
+
+    def _translation_path(self, novel_id: str, chapter_index: int, target: str) -> Path:
+        return novel_manager._novel_path(novel_id) / "translations" / f"chapter_{chapter_index}_{target}.txt"
+
+    def _load_llm(self):
+        if self._llm is not None:
+            return self._llm
+        if self._llm_error:
+            raise RuntimeError(self._llm_error)
+        try:
+            from llama_cpp import Llama
+
+            model_files = sorted(NOCLE_MODELS_DIR.glob("*.gguf"))
+            if not model_files:
+                raise FileNotFoundError(f"No .gguf model found in {NOCLE_MODELS_DIR}")
+            with self._lock:
+                if self._llm is None:
+                    self._llm = Llama(
+                        model_path=str(model_files[0]),
+                        n_gpu_layers=-1,
+                        n_ctx=8192,
+                        n_batch=512,
+                        verbose=False,
+                    )
+            return self._llm
+        except Exception as exc:
+            self._llm_error = (
+                "nocle translation engine is unavailable. Install llama-cpp-python "
+                f"and verify the GGUF model. Details: {exc}"
+            )
+            raise RuntimeError(self._llm_error) from exc
+
+    def _prompt(self, source: str, target: str, chunk: str) -> str:
+        system = (
+            "You are a professional literary translator. Translate faithfully. "
+            "Keep paragraph breaks, names, punctuation style, and do not continue or summarize the story."
+        )
+        user = f"Source language: {source}\nTarget language: {target}\n\nText:\n{chunk}"
+        return (
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+            f"{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+            f"{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+
+    def _translate_text(self, text: str, source: str, target: str, task: dict[str, Any]) -> str:
+        llm = self._load_llm()
+        chunks = chunk_text(text)
+        outputs: list[str] = []
+        for index, chunk in enumerate(chunks):
+            task["progress"] = int((index / max(1, len(chunks))) * 90)
+            response = llm(
+                self._prompt(source, target, chunk),
+                max_tokens=min(4096, max(512, int(len(chunk) * 1.8))),
+                temperature=0.2,
+                top_p=0.9,
+                repeat_penalty=1.1,
+                stop=["<|eot_id|>"],
+            )
+            outputs.append(response["choices"][0]["text"].strip())
+        task["progress"] = 95
+        return "\n\n".join(outputs)
+
+    def translate_chapter(self, novel_id: str, chapter_index: int, source: str, target: str) -> tuple[dict[str, Any], int]:
+        chapter = novel_manager.get_chapter(novel_id, chapter_index)
+        if not chapter:
+            return {"error": "chapter not found"}, 404
+
+        cache_path = self._translation_path(novel_id, chapter_index, target)
+        if cache_path.exists():
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return {
+                    "cached": True,
+                    "novelId": novel_id,
+                    "chapterIndex": chapter_index,
+                    "target": target,
+                    "translated": f.read(),
+                }, 200
+
+        task_id = f"trans_{novel_id}_{chapter_index}_{uuid.uuid4().hex[:8]}"
+        task = {
+            "taskId": task_id,
+            "status": "running",
+            "progress": 0,
+            "novelId": novel_id,
+            "chapterIndex": chapter_index,
+            "target": target,
+            "error": None,
+            "result": None,
+        }
+        self._tasks[task_id] = task
+
+        def worker() -> None:
+            try:
+                translated = self._translate_text(chapter["content"], source, target, task)
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    f.write(translated)
+                task["status"] = "complete"
+                task["progress"] = 100
+                task["result"] = {
+                    "novelId": novel_id,
+                    "chapterIndex": chapter_index,
+                    "target": target,
+                    "translated": translated,
+                }
+            except Exception as exc:
+                task["status"] = "error"
+                task["error"] = str(exc)
+
+        threading.Thread(target=worker, name=task_id, daemon=True).start()
+        return {"cached": False, "taskId": task_id, "status": "running"}, 202
+
+    def task_status(self, task_id: str) -> dict[str, Any] | None:
+        return self._tasks.get(task_id)
 
 
-# ===================== API 路由 =====================
+novel_manager = NovelManager(NOVELS_DIR)
+tts_service = TTSService(TTS_CACHE_DIR)
+translation_service = TranslationService()
 
-# ----- 静态文件服务 -----
 
 @app.route("/")
 def index():
     return send_from_directory(str(PROJECT_DIR), "index.html")
 
 
-@app.route("/<path:path>")
-def static_files(path):
-    return send_from_directory(str(PROJECT_DIR), path)
-
-
-# ----- 小说管理 -----
-
 @app.route("/api/novels", methods=["GET"])
 def api_list_novels():
-    novels = novel_manager.list_all()
-    return jsonify({"novels": novels})
+    return jsonify({"novels": novel_manager.list_all()})
 
 
 @app.route("/api/novels/<novel_id>", methods=["GET"])
-def api_get_novel(novel_id):
+def api_get_novel(novel_id: str):
     novel = novel_manager.get(novel_id)
     if not novel:
-        return jsonify({"error": "小说不存在"}), 404
+        return jsonify({"error": "novel not found"}), 404
     return jsonify(novel)
 
 
 @app.route("/api/novels/<novel_id>/chapters/<int:chapter_index>", methods=["GET"])
-def api_get_chapter(novel_id, chapter_index):
+def api_get_chapter(novel_id: str, chapter_index: int):
     chapter = novel_manager.get_chapter(novel_id, chapter_index)
     if not chapter:
-        return jsonify({"error": "章节不存在"}), 404
+        return jsonify({"error": "chapter not found"}), 404
     return jsonify(chapter)
 
 
 @app.route("/api/novels/import", methods=["POST"])
 def api_import_novel():
-    """导入小说：支持上传TXT文件或指定URL"""
-    if "file" in request.files:
-        file = request.files["file"]
-        if file.filename == "":
-            return jsonify({"error": "未选择文件"}), 400
+    if "file" not in request.files:
+        return jsonify({"error": "TXT file is required"}), 400
 
-        temp_path = NOVELS_DIR / "_temp_upload.txt"
-        file.save(str(temp_path))
+    uploaded = request.files["file"]
+    if not uploaded.filename:
+        return jsonify({"error": "file name is empty"}), 400
 
-        title = request.form.get("title") or Path(file.filename).stem
-        author = request.form.get("author", "")
-
-        result = novel_manager.import_from_txt(str(temp_path), title=title, author=author)
+    temp_path = NOVELS_DIR / f"_upload_{uuid.uuid4().hex}.txt"
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
+    uploaded.save(str(temp_path))
+    try:
+        result = novel_manager.import_from_txt(
+            str(temp_path),
+            title=request.form.get("title") or Path(uploaded.filename).stem,
+            author=request.form.get("author", ""),
+        )
+        return jsonify({"success": True, "novel": result}), 201
+    finally:
         if temp_path.exists():
             temp_path.unlink()
-
-        return jsonify({"success": True, "novel": result}), 201
-
-    return jsonify({"error": "请上传TXT文件"}), 400
 
 
 @app.route("/api/novels/import-url", methods=["POST"])
 def api_import_from_url():
-    """从URL爬取小说"""
-    data = request.get_json()
-    url = data.get("url", "").strip()
-    title = data.get("title", "")
-
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
     if not url:
-        return jsonify({"error": "请输入URL"}), 400
-
+        return jsonify({"error": "url is required"}), 400
+    prefetch = int(data.get("prefetchChapters", 100))
     try:
-        result = novel_manager.import_from_crawl(url, title=title)
-        return jsonify({"success": True, "novel": result}), 201
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"error": f"爬取失败: {str(e)}"}), 500
+        result = novel_manager.import_from_crawl(url, title=data.get("title") or None, prefetch_chapters=prefetch)
+        status = novel_manager.crawl_status(result["id"])
+        return jsonify({"success": True, "novel": result, "crawlStatus": status}), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"crawl import failed: {exc}"}), 500
+
+
+@app.route("/api/novels/<novel_id>/crawl-status", methods=["GET"])
+def api_crawl_status(novel_id: str):
+    status = novel_manager.crawl_status(novel_id)
+    if not status:
+        return jsonify({"error": "novel not found"}), 404
+    return jsonify(status)
 
 
 @app.route("/api/novels/<novel_id>", methods=["DELETE"])
-def api_delete_novel(novel_id):
+def api_delete_novel(novel_id: str):
     if novel_manager.delete(novel_id):
         return jsonify({"success": True})
-    return jsonify({"error": "小说不存在"}), 404
+    return jsonify({"error": "novel not found"}), 404
 
 
 @app.route("/api/novels/<novel_id>/progress", methods=["PUT"])
-def api_update_progress(novel_id):
-    data = request.get_json()
-    chapter_index = data.get("chapterIndex", 0)
-    novel_manager.update_progress(novel_id, chapter_index)
-    return jsonify({"success": True})
+def api_update_progress(novel_id: str):
+    data = request.get_json(silent=True) or {}
+    if novel_manager.update_progress(novel_id, int(data.get("chapterIndex", 0))):
+        return jsonify({"success": True})
+    return jsonify({"error": "novel not found"}), 404
 
 
-# ----- 翻译 -----
+@app.route("/api/tts/voices", methods=["GET"])
+def api_tts_voices():
+    return jsonify({"voices": tts_service.list_voices()})
+
+
+@app.route("/api/tts/synthesize", methods=["POST"])
+def api_tts_synthesize():
+    data = request.get_json(silent=True) or {}
+    try:
+        text = data.get("text")
+        if not text and data.get("novelId") and data.get("chapterIndex") is not None:
+            chapter = novel_manager.get_chapter(data["novelId"], int(data["chapterIndex"]))
+            if not chapter:
+                return jsonify({"error": "chapter not found"}), 404
+            sentences = chapter.get("sentences") or split_sentences(chapter["content"])
+            sentence_index = data.get("sentenceIndex")
+            text = sentences[int(sentence_index)] if sentence_index is not None else chapter["content"]
+        result = tts_service.synthesize(text or "", data.get("voiceId") or DEFAULT_SETTINGS["voiceId"], float(data.get("rate", 1.0)))
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc), "installed": False}), 503
+    except Exception as exc:
+        return jsonify({"error": f"TTS failed: {exc}"}), 500
+
+
+@app.route("/api/tts/audio/<path:filename>", methods=["GET"])
+def api_tts_audio(filename: str):
+    return send_from_directory(str(TTS_CACHE_DIR), filename)
+
 
 @app.route("/api/translate", methods=["POST"])
-def api_translate():
-    """翻译文本"""
-    data = request.get_json()
+def api_translate_text():
+    data = request.get_json(silent=True) or {}
     text = data.get("text", "")
-    source = data.get("source", "auto")
-    target = data.get("target", "zh-cn")
+    if not text.strip():
+        return jsonify({"result": ""})
+    task_id = f"text_{uuid.uuid4().hex[:8]}"
+    task = {"taskId": task_id, "status": "running", "progress": 0, "result": None, "error": None}
+    translation_service._tasks[task_id] = task
 
-    result = translator.translate(text, source=source, target=target)
-    return jsonify({"result": result})
+    def worker() -> None:
+        try:
+            translated = translation_service._translate_text(
+                text,
+                data.get("source", "auto"),
+                data.get("target", "zh-cn"),
+                task,
+            )
+            task["status"] = "complete"
+            task["progress"] = 100
+            task["result"] = {"translated": translated}
+        except Exception as exc:
+            task["status"] = "error"
+            task["error"] = str(exc)
+
+    threading.Thread(target=worker, name=task_id, daemon=True).start()
+    return jsonify({"taskId": task_id, "status": "running"}), 202
 
 
 @app.route("/api/translate/chapter", methods=["POST"])
 def api_translate_chapter():
-    """翻译指定小说的指定章节"""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     novel_id = data.get("novelId")
     chapter_index = data.get("chapterIndex")
-    source = data.get("source", "auto")
-    target = data.get("target", "zh-cn")
-
     if not novel_id or chapter_index is None:
-        return jsonify({"error": "缺少参数 novelId 或 chapterIndex"}), 400
+        return jsonify({"error": "novelId and chapterIndex are required"}), 400
+    body, status = translation_service.translate_chapter(
+        novel_id,
+        int(chapter_index),
+        data.get("source", "auto"),
+        data.get("target", "zh-cn"),
+    )
+    return jsonify(body), status
 
-    result = translator.translate_chapter(novel_id, int(chapter_index), source, target)
-    if not result:
-        return jsonify({"error": "章节不存在"}), 404
 
-    return jsonify(result)
+@app.route("/api/translate/tasks/<task_id>", methods=["GET"])
+def api_translate_task(task_id: str):
+    task = translation_service.task_status(task_id)
+    if not task:
+        return jsonify({"error": "task not found"}), 404
+    return jsonify(task)
 
 
 @app.route("/api/translate/novel/<novel_id>", methods=["POST"])
-def api_translate_novel(novel_id):
-    """翻译整本小说"""
-    data = request.get_json()
-    source = data.get("source", "auto")
-    target = data.get("target", "zh-cn")
-
+def api_translate_novel(novel_id: str):
     novel = novel_manager.get(novel_id)
     if not novel:
-        return jsonify({"error": "小说不存在"}), 404
+        return jsonify({"error": "novel not found"}), 404
+    data = request.get_json(silent=True) or {}
+    task_ids = []
+    for chapter in novel["chapters"]:
+        result, _status = translation_service.translate_chapter(
+            novel_id,
+            int(chapter["index"]),
+            data.get("source", "auto"),
+            data.get("target", "zh-cn"),
+        )
+        if result.get("taskId"):
+            task_ids.append(result["taskId"])
+    return jsonify({"success": True, "taskIds": task_ids})
 
-    def translate_all():
-        for ch in novel["chapters"]:
-            idx = ch["index"]
-            translator.translate_chapter(novel_id, idx, source, target)
-
-    thread = threading.Thread(target=translate_all, daemon=True)
-    thread.start()
-
-    return jsonify({
-        "success": True,
-        "message": f"开始翻译 {len(novel['chapters'])} 章",
-        "taskId": f"trans_{novel_id}",
-    })
-
-
-# ----- 设置持久化 -----
 
 @app.route("/api/settings", methods=["GET"])
 def api_get_settings():
-    if SETTINGS_FILE.exists():
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            settings = json.load(f)
-    else:
-        settings = {
-            "theme": "day",
-            "fontSize": 16,
-            "lineHeight": 1.8,
-            "bgColor": "#F9F7F4",
-            "pageEffect": "updown",
-            "brightness": 100,
-            "voice": None,
-        }
+    settings = {**DEFAULT_SETTINGS, **read_json(SETTINGS_FILE, {})}
     return jsonify(settings)
 
 
 @app.route("/api/settings", methods=["POST"])
 def api_save_settings():
-    settings = request.get_json()
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
-    return jsonify({"success": True})
+    settings = {**DEFAULT_SETTINGS, **(request.get_json(silent=True) or {})}
+    write_json(SETTINGS_FILE, settings)
+    return jsonify({"success": True, "settings": settings})
 
 
-# ===================== 启动 =====================
+@app.route("/<path:path>")
+def static_files(path: str):
+    return send_from_directory(str(PROJECT_DIR), path)
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 AI 有声小说播放器后端启动中...")
-    print(f"   📂 小说存储: {NOVELS_DIR}")
-    print(f"   🌐 地址: http://localhost:{port}")
-    print(f"   📖 按 Ctrl+C 停止服务器")
-    print()
+    port = int(os.environ.get("PORT", "5000"))
+    print("Novel reader backend starting")
+    print(f"Storage: {NOVELS_DIR}")
+    print(f"URL: http://localhost:{port}")
     app.run(host="0.0.0.0", port=port, debug=True)

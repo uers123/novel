@@ -1,128 +1,164 @@
-"""
-test_delivery.py - AI 有声小说播放器 全功能交付测试
-保留此文件，随时可运行: python backend/test_delivery.py
-"""
-import os, sys, json, tempfile, unittest
-sys.path.insert(0, os.path.dirname(__file__))
-from app import app, novel_manager
+import io
+import os
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
 
-class TestImportFunction(unittest.TestCase):
+import app as app_module
+from app import NovelManager, app
+
+
+class FakeChapter:
+    def __init__(self, index, title, url):
+        self.index = index
+        self.title = title
+        self.url = url
+
+
+class FakeCrawler:
+    def __init__(self):
+        self.novel_title = "测试爬取小说"
+        self.novel_author = "测试作者"
+        self.chapters = [
+            FakeChapter(0, "第一章 起点", "https://example.test/1"),
+            FakeChapter(1, "第二章 继续", "https://example.test/2"),
+        ]
+
+    def fetch_novel_info(self, _url):
+        return True
+
+    def download_chapter(self, chapter):
+        return f"{chapter.title}\n\n这是第{chapter.index + 1}章的正文。"
+
+
+class BackendTestCase(unittest.TestCase):
     def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.old_manager = app_module.novel_manager
+        self.old_settings_file = app_module.SETTINGS_FILE
+        self.manager = NovelManager(Path(self.temp_dir) / "novels")
+        app_module.novel_manager = self.manager
+        app_module.SETTINGS_FILE = Path(self.temp_dir) / "settings.json"
         self.client = app.test_client()
-        for nid in list(novel_manager._index.keys()):
-            novel_manager.delete(nid)
-        self.test_dir = tempfile.mkdtemp()
+
     def tearDown(self):
-        for nid in list(novel_manager._index.keys()):
-            novel_manager.delete(nid)
-        import shutil
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir)
+        app_module.novel_manager = self.old_manager
+        app_module.SETTINGS_FILE = self.old_settings_file
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def _create_txt(self, name, content):
-        p = os.path.join(self.test_dir, name)
-        with open(p, 'w', encoding='utf-8') as f: f.write(content)
-        return p
+    def _txt_file(self, content):
+        path = Path(self.temp_dir) / "book.txt"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
 
-    def test_simple_txt(self):
-        result = novel_manager.import_from_txt(self._create_txt("n.txt", "内容"))
-        self.assertEqual(result['title'], 'n')
 
-    def test_chapter_titles(self):
-        content = "第一章 少年\n少年走在路上。\n第二章 中年\n中年思考。"
-        result = novel_manager.import_from_txt(self._create_txt("t.txt", content), title="测试")
-        novel = novel_manager.get(result['id'])
-        self.assertEqual(len(novel['chapters']), 2)
-        self.assertEqual(novel['chapters'][0]['title'], '第一章 少年')
+class TestTxtImport(BackendTestCase):
+    def test_import_txt_splits_chapters(self):
+        result = self.manager.import_from_txt(
+            self._txt_file("第一章 开始\n第一章正文。\n\n第二章 后来\n第二章正文。"),
+            title="本地书",
+        )
 
-    def test_chapter_content(self):
-        content = "第一章 测试\n这是第一段。"
-        result = novel_manager.import_from_txt(self._create_txt("c.txt", content), title="C")
-        ch = novel_manager.get_chapter(result['id'], 0)
-        self.assertIn('第一段', ch['content'])
+        novel = self.manager.get(result["id"])
+        self.assertEqual(novel["title"], "本地书")
+        self.assertEqual(len(novel["chapters"]), 2)
+        chapter = self.manager.get_chapter(result["id"], 0)
+        self.assertIn("第一章正文", chapter["content"])
+        self.assertTrue(chapter["sentences"])
 
-    def test_empty_file(self):
-        result = novel_manager.import_from_txt(self._create_txt("e.txt", ""), title="空")
-        self.assertIsNotNone(result)
+    def test_upload_api(self):
+        data = {
+            "title": "上传书",
+            "author": "作者",
+            "file": (io.BytesIO("第一章 上传\n正文。".encode("utf-8")), "upload.txt"),
+        }
+        response = self.client.post("/api/novels/import", data=data, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["novel"]["title"], "上传书")
 
-    def test_api_import(self):
-        content = "第一章 API\nAPI导入测试内容。"
-        p = self._create_txt("api.txt", content)
-        with open(p, 'rb') as f:
-            resp = self.client.post('/api/novels/import', data={
-                'file': (f, 'api.txt'), 'title': 'API测试', 'author': '作者',
-            })
-        self.assertEqual(resp.status_code, 201)
-        self.assertEqual(json.loads(resp.data)['novel']['title'], 'API测试')
 
-class TestSettingsAPI(unittest.TestCase):
-    def setUp(self): self.client = app.test_client()
-    def test_get_settings(self):
-        r = self.client.get('/api/settings'); self.assertEqual(r.status_code, 200)
-    def test_save_settings(self):
-        self.client.post('/api/settings', json={'theme':'night','fontSize':20})
-        r = self.client.get('/api/settings')
-        self.assertEqual(json.loads(r.data)['theme'], 'night')
-
-class TestTranslationAPI(unittest.TestCase):
-    def setUp(self): self.client = app.test_client()
-    def test_translate(self):
-        r = self.client.post('/api/translate', json={'text':'Hello'})
-        self.assertEqual(r.status_code, 200); self.assertIn('result', json.loads(r.data))
-    def test_empty(self):
-        r = self.client.post('/api/translate', json={'text':''})
-        self.assertEqual(json.loads(r.data)['result'], '')
-
-class TestNovelAPI(unittest.TestCase):
+class TestCrawlImport(BackendTestCase):
     def setUp(self):
-        self.client = app.test_client()
-        for nid in list(novel_manager._index.keys()): novel_manager.delete(nid)
-        d = tempfile.mkdtemp(); p = os.path.join(d, "n.txt")
-        with open(p, 'w', encoding='utf-8') as f: f.write("第一章 测试\n内容")
-        self.novel = novel_manager.import_from_txt(p, title="列表测试")
-        import shutil; shutil.rmtree(d)
-    def tearDown(self):
-        for nid in list(novel_manager._index.keys()): novel_manager.delete(nid)
-    def test_list(self): self.assertEqual(self.client.get('/api/novels').status_code, 200)
-    def test_detail(self):
-        r = self.client.get(f'/api/novels/{self.novel["id"]}')
-        self.assertEqual(json.loads(r.data)['title'], '列表测试')
-    def test_404(self): self.assertEqual(self.client.get('/api/novels/x').status_code, 404)
-    def test_progress(self):
-        r = self.client.put(f'/api/novels/{self.novel["id"]}/progress', json={'chapterIndex':1})
-        self.assertEqual(r.status_code, 200)
-    def test_delete(self):
-        self.client.delete(f'/api/novels/{self.novel["id"]}')
-        self.assertEqual(self.client.get(f'/api/novels/{self.novel["id"]}').status_code, 404)
+        super().setUp()
+        self.manager._new_crawler = lambda: FakeCrawler()
 
-class TestFrontend(unittest.TestCase):
-    def setUp(self): self.client = app.test_client()
-    def test_index(self):
-        html = self.client.get('/').data.decode('utf-8')
-        for v in ['view-bookshelf','view-reader','audio-bar','settings-modal','voices-grid','toc-modal']:
-            self.assertIn(v, html)
-    def test_js(self):
-        for f in ['app.js','reader.js','settings.js','audio.js','toc.js','data.js']:
-            r = self.client.get(f'/js/{f}')
-            self.assertEqual(r.status_code, 200, f)
-    def test_css(self):
-        for f in ['style.css','themes.css']:
-            self.assertEqual(self.client.get(f'/css/{f}').status_code, 200)
+    def test_import_url_catalog_and_lazy_load_chapter(self):
+        result = self.manager.import_from_crawl("https://example.test/catalog", prefetch_chapters=0)
+        status = self.manager.crawl_status(result["id"])
+        self.assertEqual(status["cached"], 0)
 
-class TestCrawlerModule(unittest.TestCase):
-    def test_importable(self):
-        root = os.path.dirname(os.path.dirname(__file__))
-        asd = os.path.join(root, 'ASD')
-        if asd not in sys.path: sys.path.insert(0, asd)
-        from novel_crawler import NovelCrawler
-        self.assertIsNotNone(NovelCrawler())
+        chapter = self.manager.get_chapter(result["id"], 1)
+        self.assertIn("第2章的正文", chapter["content"])
 
-if __name__ == '__main__':
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-    for tc in [TestImportFunction, TestSettingsAPI, TestTranslationAPI, TestNovelAPI, TestFrontend, TestCrawlerModule]:
-        suite.addTest(loader.loadTestsFromTestCase(tc))
-    result = unittest.TextTestRunner(verbosity=0).run(suite)
-    print(f"\n{'='*50}\n{result.testsRun} tests, {result.testsRun - len(result.failures) - len(result.errors)} pass")
-    if result.failures or result.errors: print(f"{len(result.failures)} failures, {len(result.errors)} errors")
-    exit(0 if result.wasSuccessful() else 1)
+        status = self.manager.crawl_status(result["id"])
+        self.assertEqual(status["cached"], 1)
+        self.assertFalse(status["inProgress"])
+
+    def test_import_url_api(self):
+        response = self.client.post(
+            "/api/novels/import-url",
+            json={"url": "https://example.test/catalog", "prefetchChapters": 0},
+        )
+        self.assertEqual(response.status_code, 201)
+        payload = response.get_json()
+        self.assertEqual(payload["novel"]["chapterCount"], 2)
+        self.assertEqual(payload["crawlStatus"]["prefetchTarget"], 0)
+
+
+class TestSettingsAndTTS(BackendTestCase):
+    def test_settings_round_trip(self):
+        response = self.client.post("/api/settings", json={"theme": "night", "fontSize": 24})
+        self.assertEqual(response.status_code, 200)
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.get_json()["theme"], "night")
+        self.assertEqual(response.get_json()["fontSize"], 24)
+
+    def test_tts_voices_and_dependency_error_are_explicit(self):
+        response = self.client.get("/api/tts/voices")
+        self.assertEqual(response.status_code, 200)
+        self.assertGreater(len(response.get_json()["voices"]), 0)
+
+        response = self.client.post("/api/tts/synthesize", json={"text": "测试朗读", "voiceId": "qinglang_male"})
+        self.assertIn(response.status_code, (200, 503))
+        if response.status_code == 503:
+            self.assertFalse(response.get_json()["installed"])
+            self.assertIn("MeloTTS", response.get_json()["error"])
+
+
+class TestTranslation(BackendTestCase):
+    def test_cached_chapter_translation_returns_immediately(self):
+        result = self.manager.import_from_txt(self._txt_file("第一章 原文\nHello world."), title="翻译书")
+        translation_dir = Path(self.temp_dir) / "novels" / result["id"] / "translations"
+        translation_dir.mkdir(parents=True, exist_ok=True)
+        (translation_dir / "chapter_0_zh-cn.txt").write_text("你好，世界。", encoding="utf-8")
+
+        response = self.client.post(
+            "/api/translate/chapter",
+            json={"novelId": result["id"], "chapterIndex": 0, "target": "zh-cn", "engine": "nocle"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["cached"])
+        self.assertIn("你好", response.get_json()["translated"])
+
+    def test_missing_translation_task_is_404(self):
+        response = self.client.get("/api/translate/tasks/not-found")
+        self.assertEqual(response.status_code, 404)
+
+
+class TestFrontendStatic(BackendTestCase):
+    def test_static_shell_contains_target_surfaces(self):
+        response = self.client.get("/")
+        html = response.data.decode("utf-8")
+        for marker in ["view-reader", "settings-modal", "voices-modal", "audio-bar", "translation-modal"]:
+            self.assertIn(marker, html)
+
+    def test_js_and_css_assets_load(self):
+        for filename in ["app.js", "reader.js", "settings.js", "audio.js", "toc.js", "data.js"]:
+            self.assertEqual(self.client.get(f"/js/{filename}").status_code, 200, filename)
+        for filename in ["style.css", "themes.css"]:
+            self.assertEqual(self.client.get(f"/css/{filename}").status_code, 200, filename)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

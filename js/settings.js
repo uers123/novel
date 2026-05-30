@@ -1,15 +1,7 @@
-/**
- * settings.js - 设置面板 (图3)
- * 亮度、字号、背景色、翻页效果、主题切换
- */
-
 const Settings = (() => {
-  // DOM 引用
   const $ = id => document.getElementById(id);
-
   const els = {
     modal: $('settings-modal'),
-    close: $('settings-close'),
     brightness: $('brightness-slider'),
     fontSize: $('fontsize-slider'),
     fontSizeDisplay: $('fontsize-display'),
@@ -18,187 +10,148 @@ const Settings = (() => {
     eyeCare: $('set-eye-care'),
     autoRead: $('set-auto-read'),
     readerContent: $('reader-content'),
-    chapterText: $('chapter-text'),
+    nightBtn: $('nav-night'),
   };
 
-  // 默认设置
   let _settings = {
     theme: 'day',
-    fontSize: 16,
-    lineHeight: 1.8,
-    bgColor: '#F9F7F4',
+    fontSize: 20,
+    lineHeight: 2.0,
+    bgColor: '#F6F3EC',
     pageEffect: 'updown',
     brightness: 100,
+    autoRead: false,
+    voiceId: 'qinglang_male',
   };
+  let _hasLocalSettings = false;
 
-  /** 从 localStorage 加载设置 */
-  function load() {
-    try {
-      const saved = Storage ? Storage.getSettings() : null;
-      if (saved) {
-        _settings = { ..._settings, ...saved };
-      }
-    } catch (e) {
-      // fallback to defaults
-    }
+  function init() {
+    _loadLocal();
     _applyAll();
+    _loadServer();
+    _bindEvents();
   }
 
-  /** 获取当前设置 */
+  function _bindEvents() {
+    document.getElementById('nav-settings').addEventListener('click', () => {
+      els.modal.classList.add('active');
+    });
+    els.modal.addEventListener('click', event => {
+      if (event.target === els.modal) els.modal.classList.remove('active');
+    });
+
+    els.brightness.addEventListener('input', () => set('brightness', parseInt(els.brightness.value, 10), false));
+    els.brightness.addEventListener('change', () => _persist());
+    els.fontSize.addEventListener('input', () => set('fontSize', parseInt(els.fontSize.value, 10), false));
+    els.fontSize.addEventListener('change', () => _persist());
+
+    els.colorPalette.addEventListener('click', event => {
+      const swatch = event.target.closest('.color-swatch');
+      if (!swatch) return;
+      set('bgColor', swatch.dataset.color);
+    });
+
+    els.effectOptions.addEventListener('click', event => {
+      const option = event.target.closest('.effect-option');
+      if (!option) return;
+      set('pageEffect', option.dataset.effect);
+    });
+
+    els.eyeCare.addEventListener('click', () => {
+      set('theme', _settings.theme === 'eye' ? 'day' : 'eye');
+    });
+
+    els.autoRead.addEventListener('click', () => {
+      set('autoRead', !_settings.autoRead);
+    });
+
+    els.nightBtn.addEventListener('click', () => {
+      set('theme', _settings.theme === 'night' ? 'day' : 'night');
+    });
+  }
+
+  function _loadLocal() {
+    try {
+      const saved = localStorage.getItem('novel_settings');
+      if (saved) {
+        _hasLocalSettings = true;
+        _settings = { ..._settings, ...JSON.parse(saved) };
+      }
+    } catch (_e) {}
+  }
+
+  async function _loadServer() {
+    try {
+      const response = await fetch('/api/settings');
+      if (!response.ok) return;
+      const data = await response.json();
+      _settings = _hasLocalSettings ? { ...data, ..._settings } : { ..._settings, ...data };
+      _applyAll();
+    } catch (_e) {}
+  }
+
   function get() {
     return { ..._settings };
   }
 
-  /** 保存到 localStorage + 后端 */
+  function set(key, value, persist = true) {
+    _settings[key] = value;
+    _apply(key);
+    if (persist) _persist();
+  }
+
   function _persist() {
     try {
-      if (typeof Storage !== 'undefined') {
-        Storage.saveSettings(_settings);
-      }
-      // 同步到后端
+      localStorage.setItem('novel_settings', JSON.stringify(_settings));
       fetch('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(_settings),
       }).catch(() => {});
-    } catch (e) { /* silent */ }
+    } catch (_e) {}
   }
 
-  /** 应用所有设置 */
   function _applyAll() {
-    _applyTheme();
-    _applyFontSize();
-    _applyBgColor();
-    _applyBrightness();
-    _applyPageEffect();
+    ['theme', 'fontSize', 'lineHeight', 'bgColor', 'brightness', 'pageEffect', 'autoRead'].forEach(_apply);
     _syncUI();
   }
 
-  /** 应用主题 */
-  function _applyTheme() {
-    document.documentElement.setAttribute('data-theme', _settings.theme);
+  function _apply(key) {
+    if (key === 'theme') {
+      document.documentElement.setAttribute('data-theme', _settings.theme);
+      els.nightBtn.innerHTML = _settings.theme === 'night' ? '☀<span>日间</span>' : '☾<span>夜间</span>';
+    }
+    if (key === 'fontSize') {
+      document.documentElement.style.setProperty('--reader-font-size', `${_settings.fontSize}px`);
+      els.fontSizeDisplay.textContent = _settings.fontSize;
+    }
+    if (key === 'lineHeight') {
+      document.documentElement.style.setProperty('--reader-line-height', _settings.lineHeight);
+    }
+    if (key === 'bgColor') {
+      els.readerContent.style.backgroundColor = _settings.bgColor;
+      els.colorPalette.querySelectorAll('.color-swatch').forEach(item => {
+        item.classList.toggle('active', item.dataset.color === _settings.bgColor);
+      });
+    }
+    if (key === 'brightness') {
+      document.body.style.setProperty('--brightness-filter', `brightness(${_settings.brightness / 100})`);
+    }
+    if (key === 'pageEffect') {
+      els.effectOptions.querySelectorAll('.effect-option').forEach(item => {
+        item.classList.toggle('active', item.dataset.effect === _settings.pageEffect);
+      });
+    }
+    if (key === 'autoRead') {
+      els.autoRead.classList.toggle('active', Boolean(_settings.autoRead));
+    }
   }
 
-  /** 应用字号 */
-  function _applyFontSize() {
-    const root = document.documentElement;
-    root.style.setProperty('--reader-font-size', _settings.fontSize + 'px');
-    els.fontSizeDisplay.textContent = _settings.fontSize;
-  }
-
-  /** 应用背景色 */
-  function _applyBgColor() {
-    els.readerContent.style.backgroundColor = _settings.bgColor;
-    // 更新色板选中状态
-    els.colorPalette.querySelectorAll('.color-swatch').forEach(el => {
-      const color = el.dataset.color;
-      el.classList.toggle('active', color === _settings.bgColor);
-    });
-  }
-
-  /** 应用亮度 */
-  function _applyBrightness() {
-    const bright = _settings.brightness / 100;
-    document.body.style.setProperty('--brightness-filter', `brightness(${bright})`);
-  }
-
-  /** 应用翻页效果 */
-  function _applyPageEffect() {
-    els.effectOptions.querySelectorAll('.effect-option').forEach(el => {
-      el.classList.toggle('active', el.dataset.effect === _settings.pageEffect);
-    });
-  }
-
-  /** 同步 UI 控件值与当前设置 */
   function _syncUI() {
     els.brightness.value = _settings.brightness;
     els.fontSize.value = _settings.fontSize;
     els.fontSizeDisplay.textContent = _settings.fontSize;
   }
 
-  /** 修改单个设置项 */
-  function set(key, value) {
-    _settings[key] = value;
-    _persist();
-
-    switch (key) {
-      case 'theme': _applyTheme(); break;
-      case 'fontSize': _applyFontSize(); break;
-      case 'bgColor': _applyBgColor(); break;
-      case 'brightness': _applyBrightness(); break;
-      case 'pageEffect': _applyPageEffect(); break;
-    }
-  }
-
-  // ============ 事件绑定 ============
-
-  function init() {
-    // 打开/关闭
-    document.getElementById('nav-settings').addEventListener('click', () => {
-      els.modal.classList.add('active');
-    });
-    els.close.addEventListener('click', () => {
-      els.modal.classList.remove('active');
-    });
-    els.modal.addEventListener('click', (e) => {
-      if (e.target === els.modal) els.modal.classList.remove('active');
-    });
-
-    // 亮度
-    els.brightness.addEventListener('input', () => {
-      _settings.brightness = parseInt(els.brightness.value);
-      _applyBrightness();
-    });
-    els.brightness.addEventListener('change', _persist);
-
-    // 字号
-    els.fontSize.addEventListener('input', () => {
-      _settings.fontSize = parseInt(els.fontSize.value);
-      _applyFontSize();
-    });
-    els.fontSize.addEventListener('change', _persist);
-
-    // 背景色板
-    els.colorPalette.addEventListener('click', (e) => {
-      const swatch = e.target.closest('.color-swatch');
-      if (!swatch) return;
-      _settings.bgColor = swatch.dataset.color;
-      _applyBgColor();
-      _persist();
-    });
-
-    // 翻页效果
-    els.effectOptions.addEventListener('click', (e) => {
-      const opt = e.target.closest('.effect-option');
-      if (!opt) return;
-      _settings.pageEffect = opt.dataset.effect;
-      _applyPageEffect();
-      _persist();
-    });
-
-    // 护眼模式 = 切换到护眼主题
-    els.eyeCare.addEventListener('click', () => {
-      set('theme', _settings.theme === 'eye' ? 'day' : 'eye');
-      // 更新夜间按钮图标
-      const nightBtn = document.getElementById('nav-night');
-      if (nightBtn) {
-        nightBtn.innerHTML = _settings.theme === 'night' ? '☀<span>日间</span>' : '🌙<span>夜间</span>';
-      }
-    });
-
-    // 夜间模式快捷切换 (底部导航)
-    document.getElementById('nav-night').addEventListener('click', () => {
-      const themes = ['day', 'night', 'eye', 'parchment'];
-      const current = themes.indexOf(_settings.theme);
-      const next = themes[(current + 1) % themes.length];
-      set('theme', next);
-      const nightBtn = document.getElementById('nav-night');
-      nightBtn.innerHTML = next === 'night' ? '☀<span>日间</span>' : '🌙<span>夜间</span>';
-    });
-
-    // 加载设置
-    load();
-  }
-
-  return { init, load, get, set };
+  return { init, get, set };
 })();

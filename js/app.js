@@ -1,244 +1,183 @@
-/**
- * app.js - 主应用逻辑
- * 书架渲染、页面路由、小说导入、翻译、更多菜单
- */
-
 const App = (() => {
-  // ============ 状态 ============
   let _novels = [];
-
-  // 当前阅读中的小说（供其他模块访问）
   window._currentNovel = null;
 
-  // ============ 初始化 ============
   async function init() {
-    // 初始化各模块
     Settings.init();
     TOC.init();
     Reader.init();
-    AudioPlayer.init();
-
-    // 绑定 UI 事件
+    await AudioPlayer.init();
+    _bindTabs();
     _bindImportEvents();
     _bindMenuEvents();
     _bindTranslationEvents();
-
-    // 从后端加载小说列表
     await _loadNovels();
-
-    // 如果没有后端小说，使用本地示例数据
-    if (_novels.length === 0) {
-      _loadLocalBooks();
-    }
-
-    // 渲染书架
+    if (_novels.length === 0) _loadLocalBooks();
     renderBookshelf();
-
-    console.log('App initialized');
   }
 
-  // ============ 数据加载 ============
-
-  /** 从后端加载小说列表 */
   async function _loadNovels() {
     try {
-      const resp = await fetch('/api/novels');
-      if (resp.ok) {
-        const data = await resp.json();
+      const response = await fetch('/api/novels');
+      if (response.ok) {
+        const data = await response.json();
         _novels = data.novels || [];
         return;
       }
-    } catch (e) {
-      // 后端不可用，使用本地数据
-    }
+    } catch (_e) {}
     _novels = [];
   }
 
-  /** 加载本地示例书籍 */
   function _loadLocalBooks() {
-    if (typeof BOOKS_DATA !== 'undefined') {
-      _novels = BOOKS_DATA.map(b => ({
-        id: b.id,
-        title: b.title,
-        author: b.author,
-        coverColor: b.coverColor,
-        progress: b.progress,
-        description: b.description,
-        chapterCount: (b.chapters || []).length,
-        local: true,
-      }));
-    }
+    if (typeof BOOKS_DATA === 'undefined') return;
+    _novels = BOOKS_DATA.map(book => ({
+      id: book.id,
+      title: book.title,
+      author: book.author,
+      coverColor: book.coverColor,
+      progress: book.progress || 0,
+      description: book.description,
+      chapterCount: (book.chapters || []).length,
+      local: true,
+    }));
   }
-
-  // ============ 书架渲染 ============
 
   function renderBookshelf(filter) {
     const grid = document.getElementById('bookshelf-grid');
     grid.innerHTML = '';
+    let books = _novels.slice();
+    if (filter === 'reading') books = books.filter(book => book.progress > 0 && book.progress < 100);
+    if (filter === 'done') books = books.filter(book => book.progress >= 100);
 
-    let books = _novels;
-
-    // 过滤
-    if (filter === 'reading') {
-      books = books.filter(b => b.progress > 0 && b.progress < 100);
-    } else if (filter === 'done') {
-      books = books.filter(b => b.progress >= 100);
-    }
-
-    if (books.length === 0) {
+    if (!books.length) {
       grid.innerHTML = `
-        <div style="grid-column:1/-1;text-align:center;padding:60px 20px;color:var(--text-secondary)">
-          <p style="font-size:48px;margin-bottom:12px">📚</p>
+        <div class="empty-bookshelf">
+          <div class="empty-icon">书</div>
           <p>书架空空如也</p>
-          <p style="font-size:13px;margin-top:4px">点击右下角 + 导入小说</p>
+          <span>点击右下角 + 导入小说</span>
         </div>
       `;
       return;
     }
 
     books.forEach(book => {
-      const card = document.createElement('div');
+      const card = document.createElement('button');
       card.className = 'book-card';
       card.innerHTML = `
-        <div class="book-cover" style="background:${book.coverColor || '#5A7A9A'}">
-          ${book.title ? book.title[0] : '?'}
-        </div>
-        <div class="book-title">${book.title}</div>
-        <div class="book-author">${book.author || ''}</div>
-        <div class="book-progress">
-          <div class="book-progress-bar" style="width:${book.progress || 0}%"></div>
-        </div>
+        <div class="book-cover" style="background:${book.coverColor || '#5A7A9A'}">${_escapeHtml((book.title || '?')[0])}</div>
+        <div class="book-title">${_escapeHtml(book.title || '未命名')}</div>
+        <div class="book-author">${_escapeHtml(book.author || '')}</div>
+        <div class="book-progress"><div class="book-progress-bar" style="width:${book.progress || 0}%"></div></div>
       `;
       card.addEventListener('click', () => _openBook(book));
       grid.appendChild(card);
     });
   }
 
-  /** 打开书籍 */
   async function _openBook(book) {
     window._currentNovel = book;
-
     if (book.local) {
-      // 本地书籍 - 使用 BOOKS_DATA
-      const bd = (typeof BOOKS_DATA !== 'undefined')
-        ? BOOKS_DATA.find(b => b.id === book.id)
-        : null;
-      if (bd) {
+      const localBook = typeof BOOKS_DATA !== 'undefined' ? BOOKS_DATA.find(item => item.id === book.id) : null;
+      if (localBook) {
         const progress = Storage.getProgress(book.id);
-        Reader.open(book.id, bd.chapters, progress.chapterIdx || 0);
-        return;
+        window._currentNovel = { ...book, chapters: localBook.chapters };
+        Reader.open(book.id, localBook.chapters, progress.chapterIdx || 0);
       }
+      return;
     }
 
-    // 后端书籍
     try {
-      const resp = await fetch(`/api/novels/${book.id}`);
-      if (resp.ok) {
-        const data = await resp.json();
-        window._currentNovel = data;
-        const chapters = data.chapters || [];
-        Reader.open(book.id, chapters, data.progress || 0);
-      }
-    } catch (e) {
-      console.error('Failed to open book:', e);
+      const response = await fetch(`/api/novels/${book.id}`);
+      if (!response.ok) throw new Error('无法打开小说');
+      const data = await response.json();
+      window._currentNovel = data;
+      Reader.open(book.id, data.chapters || [], data.progress || 0);
+    } catch (error) {
+      alert(error.message || '打开小说失败');
     }
   }
 
-  // ============ 导入事件 ============
+  function _bindTabs() {
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(item => item.classList.remove('active'));
+        tab.classList.add('active');
+        renderBookshelf(tab.dataset.tab);
+      });
+    });
+  }
 
   function _bindImportEvents() {
     const importModal = document.getElementById('import-modal');
     const uploadZone = document.getElementById('upload-zone');
     const fileInput = document.getElementById('file-input');
-    const uploadForm = document.getElementById('upload-form');
     const importSubmit = document.getElementById('import-submit');
     const crawlSubmit = document.getElementById('crawl-submit');
     const crawlUrl = document.getElementById('crawl-url');
     const crawlProgress = document.getElementById('crawl-progress');
+    const crawlProgressText = document.getElementById('crawl-progress-text');
 
-    // 打开导入面板
-    document.getElementById('btn-import').addEventListener('click', () => {
-      importModal.classList.add('active');
+    document.getElementById('btn-import').addEventListener('click', () => importModal.classList.add('active'));
+    document.getElementById('import-close').addEventListener('click', () => importModal.classList.remove('active'));
+    importModal.addEventListener('click', event => {
+      if (event.target === importModal) importModal.classList.remove('active');
     });
 
-    document.getElementById('import-close').addEventListener('click', () => {
-      importModal.classList.remove('active');
-    });
-    importModal.addEventListener('click', (e) => {
-      if (e.target === importModal) importModal.classList.remove('active');
-    });
-
-    // 上传区域点击
     uploadZone.addEventListener('click', () => fileInput.click());
-
-    // 拖拽上传
-    uploadZone.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      uploadZone.style.borderColor = 'var(--accent)';
+    uploadZone.addEventListener('dragover', event => {
+      event.preventDefault();
+      uploadZone.classList.add('dragging');
     });
-    uploadZone.addEventListener('dragleave', () => {
-      uploadZone.style.borderColor = '';
-    });
-    uploadZone.addEventListener('drop', (e) => {
-      e.preventDefault();
-      uploadZone.style.borderColor = '';
-      if (e.dataTransfer.files.length) {
-        fileInput.files = e.dataTransfer.files;
-        _handleFileSelect(e.dataTransfer.files[0]);
+    uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragging'));
+    uploadZone.addEventListener('drop', event => {
+      event.preventDefault();
+      uploadZone.classList.remove('dragging');
+      if (event.dataTransfer.files.length) {
+        fileInput.files = event.dataTransfer.files;
+        _handleFileSelect(event.dataTransfer.files[0]);
       }
     });
-
-    // 选择文件
     fileInput.addEventListener('change', () => {
-      if (fileInput.files.length) {
-        _handleFileSelect(fileInput.files[0]);
-      }
+      if (fileInput.files.length) _handleFileSelect(fileInput.files[0]);
     });
+    importSubmit.addEventListener('click', _doImport);
 
-    // 确认导入
-    importSubmit.addEventListener('click', () => _doImport());
-
-    // 爬取
     crawlSubmit.addEventListener('click', async () => {
       const url = crawlUrl.value.trim();
-      if (!url) { alert('请输入小说URL'); return; }
+      if (!url) {
+        alert('请输入小说目录页 URL');
+        return;
+      }
 
       crawlProgress.style.display = 'block';
+      crawlProgressText.textContent = '正在导入目录并预抓100章...';
       crawlSubmit.disabled = true;
-
       try {
-        const resp = await fetch('/api/novels/import-url', {
+        const response = await fetch('/api/novels/import-url', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url }),
+          body: JSON.stringify({ url, prefetchChapters: 100 }),
         });
-
-        if (resp.ok) {
-          const result = await resp.json();
-          alert(`✅ 爬取成功: ${result.novel.title}`);
-          crawlUrl.value = '';
-          await _loadNovels();
-          renderBookshelf();
-          importModal.classList.remove('active');
-        } else {
-          const err = await resp.json();
-          alert(`❌ ${err.error || '爬取失败'}`);
-        }
-      } catch (e) {
-        alert('❌ 网络错误，请确认后端已启动');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '爬取失败');
+        crawlProgressText.textContent = `已导入《${data.novel.title}》，后台继续缓存章节`;
+        await _loadNovels();
+        renderBookshelf();
+        setTimeout(() => importModal.classList.remove('active'), 500);
+      } catch (error) {
+        alert(error.message || '爬取失败');
       } finally {
-        crawlProgress.style.display = 'none';
         crawlSubmit.disabled = false;
+        setTimeout(() => { crawlProgress.style.display = 'none'; }, 1200);
       }
     });
   }
 
   function _handleFileSelect(file) {
-    if (!file.name.endsWith('.txt')) {
+    if (!file.name.toLowerCase().endsWith('.txt')) {
       alert('请选择 TXT 文件');
       return;
     }
-
     document.getElementById('upload-form').style.display = 'block';
     document.getElementById('upload-zone').style.display = 'none';
     document.getElementById('import-title').value = file.name.replace(/\.txt$/i, '');
@@ -246,182 +185,141 @@ const App = (() => {
 
   async function _doImport() {
     const fileInput = document.getElementById('file-input');
-    const title = document.getElementById('import-title').value.trim() || '未命名小说';
-    const author = document.getElementById('import-author').value.trim();
-
     if (!fileInput.files.length) return;
 
     const formData = new FormData();
     formData.append('file', fileInput.files[0]);
-    formData.append('title', title);
-    formData.append('author', author);
+    formData.append('title', document.getElementById('import-title').value.trim() || '未命名小说');
+    formData.append('author', document.getElementById('import-author').value.trim());
 
     try {
-      const resp = await fetch('/api/novels/import', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (resp.ok) {
-        const result = await resp.json();
-        alert(`✅ 导入成功: ${result.novel.title}`);
-        // 重置表单
-        document.getElementById('upload-form').style.display = 'none';
-        document.getElementById('upload-zone').style.display = 'block';
-        fileInput.value = '';
-        document.getElementById('import-author').value = '';
-        // 刷新书架
-        await _loadNovels();
-        renderBookshelf();
-        document.getElementById('import-modal').classList.remove('active');
-      } else {
-        const err = await resp.json();
-        alert(`❌ ${err.error || '导入失败'}`);
-      }
-    } catch (e) {
-      alert('❌ 网络错误，请确认后端已启动');
+      const response = await fetch('/api/novels/import', { method: 'POST', body: formData });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '导入失败');
+      await _loadNovels();
+      renderBookshelf();
+      fileInput.value = '';
+      document.getElementById('upload-form').style.display = 'none';
+      document.getElementById('upload-zone').style.display = 'block';
+      document.getElementById('import-modal').classList.remove('active');
+    } catch (error) {
+      alert(error.message || '导入失败');
     }
   }
 
-  // ============ 更多菜单 ============
-
   function _bindMenuEvents() {
     const menuModal = document.getElementById('menu-modal');
-
-    // 关闭
-    menuModal.addEventListener('click', (e) => {
-      if (e.target === menuModal) menuModal.classList.remove('active');
+    menuModal.addEventListener('click', event => {
+      if (event.target === menuModal) menuModal.classList.remove('active');
     });
 
-    // 翻译本章
     document.getElementById('menu-translate').addEventListener('click', () => {
       menuModal.classList.remove('active');
       document.getElementById('translation-modal').classList.add('active');
       _prepareTranslation();
     });
 
-    // 导出 TXT
     document.getElementById('menu-export').addEventListener('click', () => {
       menuModal.classList.remove('active');
       _exportCurrentChapter();
     });
 
-    // 删除小说
+    document.getElementById('menu-info').addEventListener('click', () => {
+      menuModal.classList.remove('active');
+      alert('AI 有声小说阅读器\n支持阅读、后端TTS朗读、URL爬取和本地模型翻译。');
+    });
+
     document.getElementById('menu-delete').addEventListener('click', async () => {
       menuModal.classList.remove('active');
       const bookId = Reader.getCurrentBookId();
-      if (!bookId) return;
-
-      if (!confirm('确定删除这本小说吗？')) return;
-
-      try {
-        const resp = await fetch(`/api/novels/${bookId}`, { method: 'DELETE' });
-        if (resp.ok) {
-          alert('已删除');
-          Reader.goBack();
-        }
-      } catch (e) {
-        alert('删除失败');
+      if (!bookId || !confirm('确定删除这本小说吗？')) return;
+      const response = await fetch(`/api/novels/${bookId}`, { method: 'DELETE' });
+      if (response.ok) {
+        await _loadNovels();
+        Reader.goBack();
       }
-    });
-
-    // 关于
-    document.getElementById('menu-info').addEventListener('click', () => {
-      menuModal.classList.remove('active');
-      alert('AI 有声小说播放器 v1.0\n\n纯前端 + Flask 后端\n支持导入、爬取、翻译');
     });
   }
 
-  /** 导出当前章节为 TXT */
   function _exportCurrentChapter() {
-    const title = document.getElementById('chapter-title').textContent;
-    const text = document.getElementById('chapter-text').textContent;
-    const content = `${title}\n\n${text}`;
-
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const title = document.getElementById('chapter-title').textContent || 'chapter';
+    const text = Reader.getCurrentChapterText();
+    const blob = new Blob([`${title}\n\n${text}`], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${title}.txt`;
-    a.click();
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${title}.txt`;
+    link.click();
     URL.revokeObjectURL(url);
   }
 
-  // ============ 翻译 ============
-
   function _bindTranslationEvents() {
-    const transModal = document.getElementById('translation-modal');
-
-    document.getElementById('translation-close').addEventListener('click', () => {
-      transModal.classList.remove('active');
+    const modal = document.getElementById('translation-modal');
+    document.getElementById('translation-close').addEventListener('click', () => modal.classList.remove('active'));
+    modal.addEventListener('click', event => {
+      if (event.target === modal) modal.classList.remove('active');
     });
-    transModal.addEventListener('click', (e) => {
-      if (e.target === transModal) transModal.classList.remove('active');
-    });
-
     document.getElementById('trans-btn-start').addEventListener('click', _doTranslation);
   }
 
   function _prepareTranslation() {
     const text = Reader.getCurrentChapterText();
-    document.getElementById('trans-original').textContent =
-      text.substring(0, 500) + (text.length > 500 ? '...' : '');
-    document.getElementById('trans-result').textContent = '点击"翻译"按钮开始';
+    document.getElementById('trans-original').textContent = text.substring(0, 700) + (text.length > 700 ? '...' : '');
+    document.getElementById('trans-result').textContent = '点击“翻译”开始';
   }
 
   async function _doTranslation() {
+    const state = Reader.getState();
     const resultBox = document.getElementById('trans-result');
-    const original = document.getElementById('trans-original');
-    const source = document.getElementById('trans-source-lang').value;
-    const target = document.getElementById('trans-target-lang').value;
-
-    resultBox.textContent = '翻译中...';
-
+    resultBox.textContent = '正在提交本地模型翻译任务...';
     try {
-      // 优先使用后端翻译
-      const resp = await fetch('/api/translate', {
+      const response = await fetch('/api/translate/chapter', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          text: original.textContent,
-          source,
-          target,
+          novelId: state.bookId,
+          chapterIndex: state.chapterIndex,
+          source: document.getElementById('trans-source-lang').value,
+          target: document.getElementById('trans-target-lang').value,
+          engine: 'nocle',
         }),
       });
-
-      if (resp.ok) {
-        const data = await resp.json();
-        resultBox.textContent = data.result || '翻译失败';
-      } else {
-        resultBox.textContent = '后端翻译服务不可用';
+      const data = await response.json();
+      if (response.status === 200 && data.translated) {
+        resultBox.textContent = data.translated;
+        return;
       }
-    } catch (e) {
-      resultBox.textContent = '翻译服务暂不可用，请确认后端已启动';
+      if (!response.ok && !data.taskId) throw new Error(data.error || '翻译任务创建失败');
+      await _pollTranslation(data.taskId, resultBox);
+    } catch (error) {
+      resultBox.textContent = error.message || '翻译失败';
     }
   }
 
-  // ============ Tab 切换 ============
-
-  function _bindTabs() {
-    document.querySelectorAll('.tab').forEach(tab => {
-      tab.addEventListener('click', () => {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        renderBookshelf(tab.dataset.tab);
-      });
-    });
+  async function _pollTranslation(taskId, resultBox) {
+    for (let i = 0; i < 240; i += 1) {
+      const response = await fetch(`/api/translate/tasks/${taskId}`);
+      const task = await response.json();
+      if (task.status === 'complete') {
+        resultBox.textContent = task.result.translated;
+        return;
+      }
+      if (task.status === 'error') throw new Error(task.error || '翻译失败');
+      resultBox.textContent = `本地模型翻译中... ${task.progress || 0}%`;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    throw new Error('翻译超时');
   }
 
-  // ============ 启动 ============
+  function _escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
 
-  // DOM 就绪后初始化
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-      _bindTabs();
-      init();
-    });
+    document.addEventListener('DOMContentLoaded', init);
   } else {
-    _bindTabs();
     init();
   }
 

@@ -1,8 +1,3 @@
-/**
- * toc.js - 目录管理
- * 侧滑目录面板、章节导航
- */
-
 const TOC = (() => {
   const els = {
     modal: document.getElementById('toc-modal'),
@@ -10,68 +5,52 @@ const TOC = (() => {
     body: document.getElementById('toc-body'),
   };
 
-  let _currentBookId = null;
   let _chapters = [];
+  let _onChapterClick = index => console.log('Navigate to chapter:', index);
 
-  /** 打开目录 */
-  function open(bookId, chapters, currentIndex) {
-    _currentBookId = bookId;
+  function open(_bookId, chapters, currentIndex) {
     _chapters = chapters || [];
     _render(currentIndex);
     els.modal.classList.add('active');
   }
 
-  /** 渲染目录列表 */
   function _render(activeIndex) {
     els.body.innerHTML = '';
     if (!_chapters.length) {
-      els.body.innerHTML = '<div class="toc-item" style="color:var(--text-secondary)">暂无章节</div>';
+      els.body.innerHTML = '<div class="toc-item empty">暂无章节</div>';
       return;
     }
-
-    _chapters.forEach((ch, i) => {
-      const div = document.createElement('div');
-      div.className = 'toc-item' + (i === activeIndex ? ' active' : '');
-      div.textContent = ch.title || `第${i + 1}章`;
-      div.addEventListener('click', () => _onChapterClick(i));
-      els.body.appendChild(div);
+    _chapters.forEach((chapter, index) => {
+      const item = document.createElement('button');
+      item.className = `toc-item ${index === activeIndex ? 'active' : ''}`;
+      item.textContent = chapter.title || `第${index + 1}章`;
+      item.addEventListener('click', () => _onChapterClick(index));
+      els.body.appendChild(item);
     });
   }
-
-  /** 点击章节回调 */
-  let _onChapterClick = (index) => {
-    // 由 reader.js 覆盖
-    console.log('Navigate to chapter:', index);
-  };
 
   function setChapterClickHandler(handler) {
     _onChapterClick = handler;
   }
 
+  function close() {
+    els.modal.classList.remove('active');
+  }
+
   function init() {
     document.getElementById('nav-toc').addEventListener('click', () => {
-      // 如果当前正在阅读，打开当前书籍的目录
       if (typeof Reader !== 'undefined' && Reader.getCurrentBookId()) {
         const state = Reader.getState();
         const novel = window._currentNovel;
-        if (novel && novel.chapters) {
-          open(novel.id, novel.chapters, state.chapterIndex);
-        }
+        open(novel && novel.id, state.chapters, state.chapterIndex);
       } else {
         open(null, [], 0);
       }
     });
-
-    els.close.addEventListener('click', () => {
-      els.modal.classList.remove('active');
+    els.close.addEventListener('click', close);
+    els.modal.addEventListener('click', event => {
+      if (event.target === els.modal) close();
     });
-    els.modal.addEventListener('click', (e) => {
-      if (e.target === els.modal) els.modal.classList.remove('active');
-    });
-  }
-
-  function close() {
-    els.modal.classList.remove('active');
   }
 
   return { init, open, close, setChapterClickHandler };
