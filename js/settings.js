@@ -8,7 +8,6 @@ const Settings = (() => {
     colorPalette: $('color-palette'),
     effectOptions: $('page-effect-options'),
     eyeCare: $('set-eye-care'),
-    autoRead: $('set-auto-read'),
     readerContent: $('reader-content'),
     nightBtn: $('nav-night'),
   };
@@ -20,7 +19,6 @@ const Settings = (() => {
     bgColor: '#F6F3EC',
     pageEffect: 'updown',
     brightness: 100,
-    autoRead: false,
     voiceId: 'qinglang_male',
   };
   let _hasLocalSettings = false;
@@ -29,6 +27,7 @@ const Settings = (() => {
     _loadLocal();
     _applyAll();
     _loadServer();
+    _loadGpuSettings();
     _bindEvents();
   }
 
@@ -59,10 +58,6 @@ const Settings = (() => {
 
     els.eyeCare.addEventListener('click', () => {
       set('theme', _settings.theme === 'eye' ? 'day' : 'eye');
-    });
-
-    els.autoRead.addEventListener('click', () => {
-      set('autoRead', !_settings.autoRead);
     });
 
     els.nightBtn.addEventListener('click', () => {
@@ -112,7 +107,7 @@ const Settings = (() => {
   }
 
   function _applyAll() {
-    ['theme', 'fontSize', 'lineHeight', 'bgColor', 'brightness', 'pageEffect', 'autoRead'].forEach(_apply);
+    ['theme', 'fontSize', 'lineHeight', 'bgColor', 'brightness', 'pageEffect'].forEach(_apply);
     _syncUI();
   }
 
@@ -120,6 +115,11 @@ const Settings = (() => {
     if (key === 'theme') {
       document.documentElement.setAttribute('data-theme', _settings.theme);
       els.nightBtn.innerHTML = _settings.theme === 'night' ? '☀<span>日间</span>' : '☾<span>夜间</span>';
+      // Clear inline bgColor when using theme colors (night/eye)
+      if (_settings.theme === 'night' || _settings.theme === 'eye') {
+        delete _settings.bgColor;
+        els.readerContent.style.backgroundColor = '';
+      }
     }
     if (key === 'fontSize') {
       document.documentElement.style.setProperty('--reader-font-size', `${_settings.fontSize}px`);
@@ -142,15 +142,63 @@ const Settings = (() => {
         item.classList.toggle('active', item.dataset.effect === _settings.pageEffect);
       });
     }
-    if (key === 'autoRead') {
-      els.autoRead.classList.toggle('active', Boolean(_settings.autoRead));
-    }
   }
 
   function _syncUI() {
     els.brightness.value = _settings.brightness;
     els.fontSize.value = _settings.fontSize;
     els.fontSizeDisplay.textContent = _settings.fontSize;
+  }
+
+  // ── GPU / VRAM settings ──────────────────────────
+
+  async function _loadGpuSettings() {
+    try {
+      const response = await fetch('/api/tts/gpu-settings');
+      if (!response.ok) return;
+      const data = await response.json();
+      if (!data.cudaAvailable) return;
+
+      const gpu = data.gpu || {};
+      document.getElementById('gpu-batch-row').style.display = '';
+      document.getElementById('gpu-half-row').style.display = '';
+      document.getElementById('gpu-cache-row').style.display = '';
+      document.getElementById('gpu-vram-row').style.display = '';
+
+      const batchSlider = document.getElementById('gpu-max-batch');
+      batchSlider.value = gpu.maxBatchSize || 5;
+      document.getElementById('gpu-batch-display').textContent = gpu.maxBatchSize + '句';
+      document.getElementById('gpu-half').checked = gpu.useHalfPrecision !== false;
+      document.getElementById('gpu-clear-cache').checked = gpu.clearCache !== false;
+      const vramSlider = document.getElementById('gpu-max-vram');
+      vramSlider.value = gpu.maxVRAM || 80;
+      document.getElementById('gpu-vram-display').textContent = gpu.maxVRAM + '%';
+
+      batchSlider.addEventListener('change', () => _saveGpuSetting('maxBatchSize', parseInt(batchSlider.value, 10)));
+      batchSlider.addEventListener('input', () => {
+        document.getElementById('gpu-batch-display').textContent = batchSlider.value + '句';
+      });
+      document.getElementById('gpu-half').addEventListener('change', () => {
+        _saveGpuSetting('useHalfPrecision', document.getElementById('gpu-half').checked);
+      });
+      document.getElementById('gpu-clear-cache').addEventListener('change', () => {
+        _saveGpuSetting('clearCache', document.getElementById('gpu-clear-cache').checked);
+      });
+      vramSlider.addEventListener('change', () => _saveGpuSetting('maxVRAM', parseInt(vramSlider.value, 10)));
+      vramSlider.addEventListener('input', () => {
+        document.getElementById('gpu-vram-display').textContent = vramSlider.value + '%';
+      });
+    } catch (_e) {}
+  }
+
+  async function _saveGpuSetting(key, value) {
+    try {
+      await fetch('/api/tts/gpu-settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [key]: value }),
+      });
+    } catch (_e) {}
   }
 
   return { init, get, set };

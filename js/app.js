@@ -10,7 +10,7 @@ const App = (() => {
     _bindTabs();
     _bindImportEvents();
     _bindMenuEvents();
-    _bindTranslationEvents();
+    _bindTranslateEvents();
     await _loadNovels();
     if (_novels.length === 0) _loadLocalBooks();
     renderBookshelf();
@@ -158,7 +158,12 @@ const App = (() => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url, prefetchChapters: 100 }),
         });
-        const data = await response.json();
+        let data;
+        try {
+          data = await response.json();
+        } catch (_jsonErr) {
+          throw new Error(`服务器错误 (${response.status})`);
+        }
         if (!response.ok) throw new Error(data.error || '爬取失败');
         crawlProgressText.textContent = `已导入《${data.novel.title}》，后台继续缓存章节`;
         await _loadNovels();
@@ -213,20 +218,26 @@ const App = (() => {
       if (event.target === menuModal) menuModal.classList.remove('active');
     });
 
-    document.getElementById('menu-translate').addEventListener('click', () => {
-      menuModal.classList.remove('active');
-      document.getElementById('translation-modal').classList.add('active');
-      _prepareTranslation();
+    const editModal = document.getElementById('edit-modal');
+    editModal.addEventListener('click', event => {
+      if (event.target === editModal) editModal.classList.remove('active');
     });
+    document.getElementById('edit-close').addEventListener('click', () => editModal.classList.remove('active'));
+    document.getElementById('edit-submit').addEventListener('click', _doEditBook);
 
     document.getElementById('menu-export').addEventListener('click', () => {
       menuModal.classList.remove('active');
       _exportCurrentChapter();
     });
 
+    document.getElementById('menu-edit').addEventListener('click', () => {
+      menuModal.classList.remove('active');
+      _openEditModal();
+    });
+
     document.getElementById('menu-info').addEventListener('click', () => {
       menuModal.classList.remove('active');
-      alert('AI 有声小说阅读器\n支持阅读、后端TTS朗读、URL爬取和本地模型翻译。');
+      alert('AI 有声小说阅读器\n支持阅读、后端TTS朗读和URL爬取。');
     });
 
     document.getElementById('menu-delete').addEventListener('click', async () => {
@@ -241,6 +252,60 @@ const App = (() => {
     });
   }
 
+  function _bindTranslateEvents() {
+    const modal = document.getElementById('translate-modal');
+    document.getElementById('nav-translate').addEventListener('click', _openTranslatePanel);
+    document.getElementById('translate-close').addEventListener('click', () => modal.classList.remove('active'));
+    modal.addEventListener('click', event => {
+      if (event.target === modal) modal.classList.remove('active');
+    });
+    document.getElementById('translate-chapter-btn').addEventListener('click', async () => {
+      const btn = document.getElementById('translate-chapter-btn');
+      btn.disabled = true;
+      btn.textContent = '翻译中...';
+      try {
+        await _translateCurrentChapter();
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '翻译本章';
+      }
+    });
+    document.getElementById('translate-target').addEventListener('change', () => {
+      // If auto-translate is on, re-translate immediately
+      if (document.getElementById('translate-auto').checked) {
+        document.getElementById('translate-chapter-btn').click();
+      }
+    });
+  }
+
+  function _openTranslatePanel() {
+    document.getElementById('translate-modal').classList.add('active');
+    document.getElementById('translate-result').textContent = '点击「翻译本章」按钮开始翻译';
+  }
+
+  async function _translateCurrentChapter() {
+    const text = Reader.getCurrentChapterText();
+    if (!text) {
+      document.getElementById('translate-result').textContent = '没有可翻译的文本';
+      return;
+    }
+    const target = document.getElementById('translate-target').value;
+    document.getElementById('translate-result').textContent = '翻译中...';
+
+    try {
+      const response = await fetch('/api/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, target, source: 'auto' }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '翻译失败');
+      document.getElementById('translate-result').textContent = data.text || '(空结果)';
+    } catch (error) {
+      document.getElementById('translate-result').textContent = `翻译失败：${error.message}`;
+    }
+  }
+
   function _exportCurrentChapter() {
     const title = document.getElementById('chapter-title').textContent || 'chapter';
     const text = Reader.getCurrentChapterText();
@@ -253,62 +318,43 @@ const App = (() => {
     URL.revokeObjectURL(url);
   }
 
-  function _bindTranslationEvents() {
-    const modal = document.getElementById('translation-modal');
-    document.getElementById('translation-close').addEventListener('click', () => modal.classList.remove('active'));
-    modal.addEventListener('click', event => {
-      if (event.target === modal) modal.classList.remove('active');
+  function _openEditModal() {
+    const book = window._currentNovel;
+    if (!book) return;
+    document.getElementById('edit-title').value = book.title || '';
+    document.getElementById('edit-author').value = book.author || '';
+    // Highlight current cover color
+    const color = book.coverColor || '#5A7A9A';
+    document.querySelectorAll('#edit-colors .color-swatch').forEach(item => {
+      item.classList.toggle('active', item.dataset.color === color);
     });
-    document.getElementById('trans-btn-start').addEventListener('click', _doTranslation);
+    document.getElementById('edit-modal').classList.add('active');
   }
 
-  function _prepareTranslation() {
-    const text = Reader.getCurrentChapterText();
-    document.getElementById('trans-original').textContent = text.substring(0, 700) + (text.length > 700 ? '...' : '');
-    document.getElementById('trans-result').textContent = '点击“翻译”开始';
-  }
-
-  async function _doTranslation() {
-    const state = Reader.getState();
-    const resultBox = document.getElementById('trans-result');
-    resultBox.textContent = '正在提交本地模型翻译任务...';
+  async function _doEditBook() {
+    const book = window._currentNovel;
+    if (!book) return;
+    const title = document.getElementById('edit-title').value.trim();
+    const author = document.getElementById('edit-author').value.trim();
+    const activeColor = document.querySelector('#edit-colors .color-swatch.active');
+    const coverColor = activeColor ? activeColor.dataset.color : '#5A7A9A';
+    if (!title) { alert('书籍名称不能为空'); return; }
     try {
-      const response = await fetch('/api/translate/chapter', {
-        method: 'POST',
+      const response = await fetch(`/api/novels/${book.id}/meta`, {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          novelId: state.bookId,
-          chapterIndex: state.chapterIndex,
-          source: document.getElementById('trans-source-lang').value,
-          target: document.getElementById('trans-target-lang').value,
-          engine: 'nocle',
-        }),
+        body: JSON.stringify({ title, author, coverColor }),
       });
+      if (!response.ok) throw new Error('保存失败');
       const data = await response.json();
-      if (response.status === 200 && data.translated) {
-        resultBox.textContent = data.translated;
-        return;
-      }
-      if (!response.ok && !data.taskId) throw new Error(data.error || '翻译任务创建失败');
-      await _pollTranslation(data.taskId, resultBox);
+      if (data.novel) window._currentNovel = data.novel;
+      document.getElementById('edit-modal').classList.remove('active');
+      // Refresh bookshelf to show updated info
+      await _loadNovels();
+      renderBookshelf();
     } catch (error) {
-      resultBox.textContent = error.message || '翻译失败';
+      alert(error.message || '保存失败');
     }
-  }
-
-  async function _pollTranslation(taskId, resultBox) {
-    for (let i = 0; i < 240; i += 1) {
-      const response = await fetch(`/api/translate/tasks/${taskId}`);
-      const task = await response.json();
-      if (task.status === 'complete') {
-        resultBox.textContent = task.result.translated;
-        return;
-      }
-      if (task.status === 'error') throw new Error(task.error || '翻译失败');
-      resultBox.textContent = `本地模型翻译中... ${task.progress || 0}%`;
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-    throw new Error('翻译超时');
   }
 
   function _escapeHtml(text) {

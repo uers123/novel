@@ -5,8 +5,7 @@ Features:
 - TXT import and URL catalog import.
 - Lazy chapter crawling with background prefetch.
 - Chapter progress and reader settings persistence.
-- Local TTS service adapter, designed for MeloTTS.
-- Local LLM translation task adapter, designed for the nocle GGUF model.
+- Local TTS service adapter, designed for ChatTTS.
 """
 
 from __future__ import annotations
@@ -46,9 +45,6 @@ PROJECT_DIR = BASE_DIR.parent
 NOVELS_DIR = BASE_DIR / "novels"
 SETTINGS_FILE = BASE_DIR / "settings.json"
 TTS_CACHE_DIR = BASE_DIR / "tts_cache"
-NOCLE_DIR = PROJECT_DIR / "nocle"
-NOCLE_MODELS_DIR = NOCLE_DIR / "models"
-
 DEFAULT_SETTINGS = {
     "theme": "day",
     "fontSize": 20,
@@ -57,7 +53,6 @@ DEFAULT_SETTINGS = {
     "pageEffect": "updown",
     "brightness": 100,
     "voiceId": "qinglang_male",
-    "autoRead": False,
 }
 
 app = Flask(__name__, static_folder=str(PROJECT_DIR), static_url_path="")
@@ -73,10 +68,30 @@ def read_json(path: Path, default: Any) -> Any:
 
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    tmp.replace(path)
+    # Use unique tmp name to avoid race conditions across threads
+    import threading
+    tid = threading.get_ident()
+    tmp = path.with_suffix(path.suffix + f".tmp.{tid}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        # Retry replace on Windows to handle transient locks (antivirus, etc.)
+        for attempt in range(3):
+            try:
+                tmp.replace(path)
+                break
+            except OSError:
+                if attempt < 2:
+                    import time
+                    time.sleep(0.05 * (attempt + 1))
+                else:
+                    # Last resort: delete destination first, then rename
+                    path.unlink(missing_ok=True)
+                    tmp.replace(path)
+    finally:
+        # Clean up tmp file if replace failed and it still exists
+        if tmp.exists():
+            tmp.unlink()
 
 
 def split_sentences(text: str) -> list[str]:
@@ -106,6 +121,20 @@ def chunk_text(text: str, max_chars: int = 2200) -> list[str]:
     if current:
         chunks.append(current)
     return chunks or ([text] if text else [])
+
+
+def _read_file_with_fallback_encoding(path: str) -> str:
+    """Read a text file trying multiple encodings (UTF-8 → GBK → GB2312 → ascii)."""
+    encodings = ["utf-8", "gbk", "gb2312", "utf-16", "ascii"]
+    for enc in encodings:
+        try:
+            with open(path, "r", encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    # Last resort: read with errors='replace'
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
 
 
 class NovelManager:
@@ -225,8 +254,7 @@ class NovelManager:
         novel_path = self._novel_path(novel_id)
         novel_path.mkdir(parents=True, exist_ok=True)
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
+        text = _read_file_with_fallback_encoding(file_path)
 
         if not title:
             title = Path(file_path).stem.replace("_", " ").replace("-", " ")
@@ -381,6 +409,9 @@ class NovelManager:
             self._refresh_crawl_counts(novel_id)
             return True
         except Exception as exc:
+            import traceback
+            print(f"PREFETCH ERROR ch{chapter_index}: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
             self._mark_crawl_failed(novel_id, chapter_index, str(exc))
             return False
 
@@ -438,6 +469,17 @@ class NovelManager:
             self._save_index()
             return True
 
+    def update_meta(self, novel_id: str, updates: dict[str, Any]) -> bool:
+        with self._lock:
+            if novel_id not in self._index:
+                return False
+            allowed = {"title", "author", "description", "coverColor"}
+            for key in allowed:
+                if key in updates:
+                    self._index[novel_id][key] = updates[key]
+            self._save_index()
+            return True
+
     def update_progress(self, novel_id: str, chapter_index: int) -> bool:
         with self._lock:
             if novel_id not in self._index:
@@ -451,208 +493,286 @@ class TTSService:
     def __init__(self, cache_dir: Path):
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._model = None
+        self.speakers_dir = cache_dir / "speakers"
+        self.speakers_dir.mkdir(parents=True, exist_ok=True)
+        self._chat = None
         self._model_error: str | None = None
         self._lock = threading.Lock()
+        self._speaker_cache: dict[str, Any] = {}
+
+        # GPU / VRAM settings (can be updated via API)
+        self.gpu = {
+            "maxBatchSize": 5,
+            "useHalfPrecision": True,
+            "clearCache": True,
+            "maxVRAM": 80,
+        }
+
         self.voices = [
-            {"id": "ruanmeng_female", "name": "软萌萝莉", "gender": "female", "avatar": "萝", "installed": False},
-            {"id": "child", "name": "萌娃童声", "gender": "child", "avatar": "童", "installed": False},
-            {"id": "dashu_male", "name": "深沉大叔", "gender": "male", "avatar": "叔", "installed": False},
-            {"id": "young_male", "name": "温柔少年", "gender": "male", "avatar": "少", "installed": False},
-            {"id": "qinglang_male", "name": "清朗男声", "gender": "male", "avatar": "朗", "installed": False},
-            {"id": "mature_male", "name": "成熟男声", "gender": "male", "avatar": "熟", "installed": False},
-            {"id": "gentle_female", "name": "温柔女声", "gender": "female", "avatar": "温", "installed": False},
-            {"id": "cool_female", "name": "清冷女声", "gender": "female", "avatar": "冷", "installed": False},
+            {"id": "ruanmeng_female", "name": "软萌萝莉", "gender": "female", "avatar": "萝", "seed": 11451},
+            {"id": "child", "name": "萌娃童声", "gender": "child", "avatar": "童", "seed": 2222},
+            {"id": "dashu_male", "name": "深沉大叔", "gender": "male", "avatar": "叔", "seed": 3333},
+            {"id": "young_male", "name": "温柔少年", "gender": "male", "avatar": "少", "seed": 4444},
+            {"id": "qinglang_male", "name": "清朗男声", "gender": "male", "avatar": "朗", "seed": 5555},
+            {"id": "mature_male", "name": "成熟男声", "gender": "male", "avatar": "熟", "seed": 6666},
+            {"id": "gentle_female", "name": "温柔女声", "gender": "female", "avatar": "温", "seed": 7777},
+            {"id": "cool_female", "name": "清冷女声", "gender": "female", "avatar": "冷", "seed": 8888},
         ]
 
+        self.emotions = {
+            "neutral": {"prompt": "[oral_0]", "temperature": 0.3},
+            "happy": {"prompt": "[oral_4][laugh_1]", "temperature": 0.5},
+            "sad": {"prompt": "[oral_1][break_4]", "temperature": 0.2},
+            "angry": {"prompt": "[oral_6]", "temperature": 0.7},
+            "surprise": {"prompt": "[oral_5][break_4]", "temperature": 0.6},
+        }
+
+    def _cuda_available(self) -> bool:
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except Exception:
+            return False
+
+    def _clear_gpu_cache(self) -> None:
+        if not self.gpu.get("clearCache"):
+            return
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _vram_usage_pct(self) -> float:
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return 0
+            allocated = torch.cuda.memory_allocated()
+            total = torch.cuda.get_device_properties(0).total_memory
+            return (allocated / total) * 100 if total > 0 else 0
+        except Exception:
+            return 0
+
+    def _maybe_throttle_batch(self, requested: int) -> int:
+        vram_pct = self._vram_usage_pct()
+        limit = self.gpu.get("maxVRAM", 80)
+        if vram_pct > limit and requested > 1:
+            reduced = max(1, requested // 2)
+            import sys
+            print(f"  VRAM {vram_pct:.0f}% > {limit}% — throttling {requested}->{reduced}", file=sys.stderr)
+            return reduced
+        return min(requested, self.gpu.get("maxBatchSize", 5))
+
+    def update_gpu_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        for key in ("maxBatchSize", "useHalfPrecision", "clearCache", "maxVRAM"):
+            if key in settings:
+                self.gpu[key] = settings[key]
+        return dict(self.gpu)
+
     def list_voices(self) -> list[dict[str, Any]]:
-        installed = self._melo_available()
+        installed = self._chattts_available()
         return [{**voice, "installed": installed} for voice in self.voices]
 
-    def _melo_available(self) -> bool:
+    def _chattts_available(self) -> bool:
         try:
-            import melo.api  # noqa: F401
-
+            import ChatTTS
             return True
         except Exception:
             return False
 
     def _load_model(self):
-        if self._model is not None:
-            return self._model
+        if self._chat is not None:
+            return self._chat
         if self._model_error:
             raise RuntimeError(self._model_error)
         try:
-            from melo.api import TTS
+            import ChatTTS
+            import numpy as np
+            import torch
 
             with self._lock:
-                if self._model is None:
-                    self._model = TTS(language="ZH", device="auto")
-            return self._model
+                if self._chat is None:
+                    chat = ChatTTS.Chat()
+                    chat.load(source="huggingface", compile=False)
+                    use_half = self._cuda_available() and self.gpu.get("useHalfPrecision", True)
+                    if use_half:
+                        try:
+                            if hasattr(chat, 'decoder') and hasattr(chat.decoder, 'half'):
+                                chat.decoder = chat.decoder.half()
+                            if hasattr(chat, 'model') and hasattr(chat.model, 'half'):
+                                chat.model = chat.model.half()
+                        except Exception:
+                            pass
+                    self._chat = chat
+                    self._init_voice_embeddings()
+                    self._clear_gpu_cache()
+            return self._chat
         except Exception as exc:
             self._model_error = (
-                "MeloTTS is not installed or failed to load. "
-                "Install and configure MeloTTS before using backend local TTS. "
+                "ChatTTS is not installed or failed to load. "
+                "Install: pip install ChatTTS torch torchaudio soundfile transformers==4.41.0. "
                 f"Details: {exc}"
             )
             raise RuntimeError(self._model_error) from exc
 
-    def synthesize(self, text: str, voice_id: str, rate: float = 1.0) -> dict[str, Any]:
+    def _init_voice_embeddings(self) -> None:
+        for voice in self.voices:
+            emb_path = self.speakers_dir / f"{voice['id']}.txt"
+            if emb_path.exists():
+                continue
+            spk_emb = self._chat.sample_random_speaker()
+            emb_path.write_text(spk_emb, encoding="utf-8")
+
+    def _get_speaker_embedding(self, voice_id: str) -> str:
+        if voice_id in self._speaker_cache:
+            return self._speaker_cache[voice_id]
+        emb_path = self.speakers_dir / f"{voice_id}.txt"
+        if emb_path.exists():
+            spk_emb = emb_path.read_text(encoding="utf-8")
+        else:
+            spk_emb = self._chat.sample_random_speaker()
+            emb_path.write_text(spk_emb, encoding="utf-8")
+        self._speaker_cache[voice_id] = spk_emb
+        return spk_emb
+
+    @staticmethod
+    def detect_emotion(text: str) -> str:
+        happy_kw = ["开心", "高兴", "快乐", "欢喜", "愉快", "兴奋", "惊喜", "美好", "棒", "赞", "哈哈", "嘻嘻", "笑了"]
+        sad_kw = ["伤心", "难过", "悲伤", "悲哀", "流泪", "痛苦", "失落", "忧愁", "可怜", "呜呜", "哭了"]
+        angry_kw = ["生气", "可恶", "该死", "混蛋", "滚开", "烦躁", "暴躁", "气死", "气人", "愤怒", "讨厌", "恨"]
+        surprise_kw = ["惊讶", "震惊", "诧异", "竟然", "居然", "没想到", "天哪", "哇", "啊呀"]
+        text_lower = text
+        scores = {"neutral": 0, "happy": 0, "sad": 0, "angry": 0, "surprise": 0}
+        for kw in happy_kw:
+            scores["happy"] += text_lower.count(kw) * 2
+        for kw in surprise_kw:
+            scores["surprise"] += text_lower.count(kw) * 2
+        for kw in sad_kw:
+            scores["sad"] += text_lower.count(kw) * 2
+        for kw in angry_kw:
+            scores["angry"] += text_lower.count(kw) * 2
+        scores["happy"] += text_lower.count("！") + text_lower.count("!")
+        scores["surprise"] += text_lower.count("？") + text_lower.count("?")
+        best = max(scores, key=scores.get)
+        return best if scores[best] > 0 else "neutral"
+
+    def _tts_params(self, voice_id: str, rate: float, emotion: str):
+        import ChatTTS as CT
+        voice_seed = 42
+        for v in self.voices:
+            if v["id"] == voice_id:
+                voice_seed = v["seed"]
+                break
+        emotion_cfg = self.emotions.get(emotion, self.emotions["neutral"])
+        spk_emb = self._get_speaker_embedding(voice_id)
+        speed_val = max(1, min(9, round(rate * 5)))
+        params_refine_text = CT.Chat.RefineTextParams(prompt=emotion_cfg["prompt"])
+        params_infer_code = CT.Chat.InferCodeParams(
+            spk_emb=spk_emb,
+            manual_seed=voice_seed,
+            temperature=emotion_cfg["temperature"],
+            top_P=0.7,
+            top_K=20,
+            prompt=f"[speed_{speed_val}]",
+        )
+        return params_refine_text, params_infer_code
+
+    def _synthesize_one(self, text: str, voice_id: str, rate: float, emotion: str) -> dict[str, Any]:
+        digest = hashlib.sha256(f"{voice_id}|{rate}|{emotion}|{text}".encode("utf-8")).hexdigest()[:24]
+        audio_path = self.cache_dir / f"{digest}.wav"
+        if audio_path.exists():
+            return {"cached": True, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
+        chat = self._load_model()
+        import soundfile as sf
+        prp, pic = self._tts_params(voice_id, rate, emotion)
+        with self._lock:
+            wavs = chat.infer([text], params_refine_text=prp, params_infer_code=pic, use_decoder=True)
+        sf.write(str(audio_path), wavs[0], 24000)
+        self._clear_gpu_cache()
+        return {"cached": False, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
+
+    def synthesize(self, text: str, voice_id: str, rate: float = 1.0, emotion: str | None = None) -> dict[str, Any]:
         text = (text or "").strip()
         if not text:
             raise ValueError("text is required")
         voice_id = voice_id or "qinglang_male"
-        digest = hashlib.sha256(f"{voice_id}|{rate}|{text}".encode("utf-8")).hexdigest()[:24]
-        audio_path = self.cache_dir / f"{digest}.wav"
+        emotion = emotion or self.detect_emotion(text)
         sentences = split_sentences(text)
+        result = self._synthesize_one(text, voice_id, rate, emotion)
+        return {**result, "sentences": sentences, "voiceId": voice_id}
 
-        if audio_path.exists():
-            return {
-                "cached": True,
-                "audioUrl": f"/api/tts/audio/{audio_path.name}",
-                "sentences": sentences,
-                "voiceId": voice_id,
-            }
-
-        model = self._load_model()
-        speaker_ids = getattr(model, "hps", None)
-        speaker_id = 0
-        try:
-            speakers = getattr(speaker_ids, "data", {}).get("spk2id", {})
-            if speakers:
-                speaker_id = next(iter(speakers.values()))
-        except Exception:
-            speaker_id = 0
-
-        model.tts_to_file(text, speaker_id, str(audio_path), speed=rate)
-        return {
-            "cached": False,
-            "audioUrl": f"/api/tts/audio/{audio_path.name}",
-            "sentences": sentences,
-            "voiceId": voice_id,
-        }
+    def synthesize_batch(self, texts: list[str], voice_id: str, rate: float = 1.0, emotion: str | None = None) -> list[dict[str, Any]]:
+        texts = [t.strip() for t in texts if t.strip()]
+        if not texts:
+            return []
+        voice_id = voice_id or "qinglang_male"
+        results: list[dict[str, Any]] = [None] * len(texts)
+        uncached: list[tuple[int, str, str, str]] = []
+        for i, text in enumerate(texts):
+            emo = emotion or self.detect_emotion(text)
+            digest = hashlib.sha256(f"{voice_id}|{rate}|{emo}|{text}".encode("utf-8")).hexdigest()[:24]
+            audio_path = self.cache_dir / f"{digest}.wav"
+            if audio_path.exists():
+                results[i] = {"index": i, "cached": True, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
+            else:
+                uncached.append((i, text, emo, digest))
+        if not uncached:
+            return results
+        chat = self._load_model()
+        import soundfile as sf
+        sub_batch_size = self._maybe_throttle_batch(len(uncached))
+        for chunk_start in range(0, len(uncached), sub_batch_size):
+            chunk = uncached[chunk_start:chunk_start + sub_batch_size]
+            chunk_texts = [item[1] for item in chunk]
+            batch_emo = chunk[0][2]
+            prp, pic = self._tts_params(voice_id, rate, batch_emo)
+            with self._lock:
+                wavs = chat.infer(chunk_texts, params_refine_text=prp, params_infer_code=pic, use_decoder=True, split_text=False)
+            for (orig_idx, text, emo, digest), wav in zip(chunk, wavs):
+                audio_path = self.cache_dir / f"{digest}.wav"
+                sf.write(str(audio_path), wav, 24000)
+                results[orig_idx] = {"index": orig_idx, "cached": False, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
+            self._clear_gpu_cache()
+        return results
 
 
 class TranslationService:
+    """Real-time text translation using deep-translator (free Google Translate API)."""
+
     def __init__(self):
-        self._llm = None
-        self._llm_error: str | None = None
+        self._cache: dict[str, str] = {}
         self._lock = threading.Lock()
-        self._tasks: dict[str, dict[str, Any]] = {}
 
-    def _translation_path(self, novel_id: str, chapter_index: int, target: str) -> Path:
-        return novel_manager._novel_path(novel_id) / "translations" / f"chapter_{chapter_index}_{target}.txt"
+    def translate(self, text: str, target: str = "zh-CN", source: str = "auto") -> dict[str, Any]:
+        if not text or not text.strip():
+            return {"text": "", "source": source, "target": target}
 
-    def _load_llm(self):
-        if self._llm is not None:
-            return self._llm
-        if self._llm_error:
-            raise RuntimeError(self._llm_error)
+        cache_key = f"{source}|{target}|{text}"
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached:
+                return {"text": cached, "source": source, "target": target, "cached": True}
+
         try:
-            from llama_cpp import Llama
-
-            model_files = sorted(NOCLE_MODELS_DIR.glob("*.gguf"))
-            if not model_files:
-                raise FileNotFoundError(f"No .gguf model found in {NOCLE_MODELS_DIR}")
+            from deep_translator import GoogleTranslator
+            translator = GoogleTranslator(source=source, target=target)
+            result = translator.translate(text)
+            translated = result or ""
             with self._lock:
-                if self._llm is None:
-                    self._llm = Llama(
-                        model_path=str(model_files[0]),
-                        n_gpu_layers=-1,
-                        n_ctx=8192,
-                        n_batch=512,
-                        verbose=False,
-                    )
-            return self._llm
+                self._cache[cache_key] = translated
+            return {"text": translated, "source": source, "target": target, "cached": False}
         except Exception as exc:
-            self._llm_error = (
-                "nocle translation engine is unavailable. Install llama-cpp-python "
-                f"and verify the GGUF model. Details: {exc}"
-            )
-            raise RuntimeError(self._llm_error) from exc
+            raise RuntimeError(f"Translation failed: {exc}")
 
-    def _prompt(self, source: str, target: str, chunk: str) -> str:
-        system = (
-            "You are a professional literary translator. Translate faithfully. "
-            "Keep paragraph breaks, names, punctuation style, and do not continue or summarize the story."
-        )
-        user = f"Source language: {source}\nTarget language: {target}\n\nText:\n{chunk}"
-        return (
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-            f"{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
-            f"{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        )
-
-    def _translate_text(self, text: str, source: str, target: str, task: dict[str, Any]) -> str:
-        llm = self._load_llm()
-        chunks = chunk_text(text)
-        outputs: list[str] = []
-        for index, chunk in enumerate(chunks):
-            task["progress"] = int((index / max(1, len(chunks))) * 90)
-            response = llm(
-                self._prompt(source, target, chunk),
-                max_tokens=min(4096, max(512, int(len(chunk) * 1.8))),
-                temperature=0.2,
-                top_p=0.9,
-                repeat_penalty=1.1,
-                stop=["<|eot_id|>"],
-            )
-            outputs.append(response["choices"][0]["text"].strip())
-        task["progress"] = 95
-        return "\n\n".join(outputs)
-
-    def translate_chapter(self, novel_id: str, chapter_index: int, source: str, target: str) -> tuple[dict[str, Any], int]:
-        chapter = novel_manager.get_chapter(novel_id, chapter_index)
-        if not chapter:
-            return {"error": "chapter not found"}, 404
-
-        cache_path = self._translation_path(novel_id, chapter_index, target)
-        if cache_path.exists():
-            with open(cache_path, "r", encoding="utf-8") as f:
-                return {
-                    "cached": True,
-                    "novelId": novel_id,
-                    "chapterIndex": chapter_index,
-                    "target": target,
-                    "translated": f.read(),
-                }, 200
-
-        task_id = f"trans_{novel_id}_{chapter_index}_{uuid.uuid4().hex[:8]}"
-        task = {
-            "taskId": task_id,
-            "status": "running",
-            "progress": 0,
-            "novelId": novel_id,
-            "chapterIndex": chapter_index,
-            "target": target,
-            "error": None,
-            "result": None,
-        }
-        self._tasks[task_id] = task
-
-        def worker() -> None:
+    def translate_batch(self, texts: list[str], target: str = "zh-CN", source: str = "auto") -> list[dict[str, Any]]:
+        results = []
+        for text in texts:
             try:
-                translated = self._translate_text(chapter["content"], source, target, task)
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    f.write(translated)
-                task["status"] = "complete"
-                task["progress"] = 100
-                task["result"] = {
-                    "novelId": novel_id,
-                    "chapterIndex": chapter_index,
-                    "target": target,
-                    "translated": translated,
-                }
-            except Exception as exc:
-                task["status"] = "error"
-                task["error"] = str(exc)
-
-        threading.Thread(target=worker, name=task_id, daemon=True).start()
-        return {"cached": False, "taskId": task_id, "status": "running"}, 202
-
-    def task_status(self, task_id: str) -> dict[str, Any] | None:
-        return self._tasks.get(task_id)
+                results.append(self.translate(text, target, source))
+            except Exception:
+                results.append({"text": "", "source": source, "target": target, "error": True})
+        return results
 
 
 novel_manager = NovelManager(NOVELS_DIR)
@@ -742,6 +862,14 @@ def api_delete_novel(novel_id: str):
     return jsonify({"error": "novel not found"}), 404
 
 
+@app.route("/api/novels/<novel_id>/meta", methods=["PUT"])
+def api_update_novel_meta(novel_id: str):
+    data = request.get_json(silent=True) or {}
+    if novel_manager.update_meta(novel_id, data):
+        return jsonify({"success": True, "novel": novel_manager.get(novel_id)})
+    return jsonify({"error": "novel not found"}), 404
+
+
 @app.route("/api/novels/<novel_id>/progress", methods=["PUT"])
 def api_update_progress(novel_id: str):
     data = request.get_json(silent=True) or {}
@@ -767,7 +895,12 @@ def api_tts_synthesize():
             sentences = chapter.get("sentences") or split_sentences(chapter["content"])
             sentence_index = data.get("sentenceIndex")
             text = sentences[int(sentence_index)] if sentence_index is not None else chapter["content"]
-        result = tts_service.synthesize(text or "", data.get("voiceId") or DEFAULT_SETTINGS["voiceId"], float(data.get("rate", 1.0)))
+        result = tts_service.synthesize(
+                text or "",
+                data.get("voiceId") or DEFAULT_SETTINGS["voiceId"],
+                float(data.get("rate", 1.0)),
+                data.get("emotion"),
+            )
         return jsonify(result)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -777,81 +910,84 @@ def api_tts_synthesize():
         return jsonify({"error": f"TTS failed: {exc}"}), 500
 
 
+@app.route("/api/tts/synthesize_batch", methods=["POST"])
+def api_tts_synthesize_batch():
+    """Batch TTS: generate audio for multiple texts in one GPU call."""
+    data = request.get_json(silent=True) or {}
+    try:
+        texts = data.get("texts", [])
+        if not texts:
+            return jsonify({"error": "texts list is required"}), 400
+        results = tts_service.synthesize_batch(
+            texts,
+            data.get("voiceId") or DEFAULT_SETTINGS["voiceId"],
+            float(data.get("rate", 1.0)),
+            data.get("emotion"),
+        )
+        return jsonify({"results": results, "count": len(results)})
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc), "installed": False}), 503
+    except Exception as exc:
+        return jsonify({"error": f"batch TTS failed: {exc}"}), 500
+
+
 @app.route("/api/tts/audio/<path:filename>", methods=["GET"])
 def api_tts_audio(filename: str):
     return send_from_directory(str(TTS_CACHE_DIR), filename)
 
 
+@app.route("/api/tts/gpu-settings", methods=["GET"])
+def api_tts_gpu_settings():
+    return jsonify({"gpu": tts_service.gpu, "cudaAvailable": tts_service._cuda_available()})
+
+
+@app.route("/api/tts/gpu-settings", methods=["PUT"])
+def api_tts_update_gpu_settings():
+    data = request.get_json(silent=True) or {}
+    settings = tts_service.update_gpu_settings(data)
+    return jsonify({"success": True, "gpu": settings})
+
+
 @app.route("/api/translate", methods=["POST"])
-def api_translate_text():
+def api_translate():
+    """Translate text with auto-detect source language."""
     data = request.get_json(silent=True) or {}
-    text = data.get("text", "")
-    if not text.strip():
-        return jsonify({"result": ""})
-    task_id = f"text_{uuid.uuid4().hex[:8]}"
-    task = {"taskId": task_id, "status": "running", "progress": 0, "result": None, "error": None}
-    translation_service._tasks[task_id] = task
-
-    def worker() -> None:
-        try:
-            translated = translation_service._translate_text(
-                text,
-                data.get("source", "auto"),
-                data.get("target", "zh-cn"),
-                task,
-            )
-            task["status"] = "complete"
-            task["progress"] = 100
-            task["result"] = {"translated": translated}
-        except Exception as exc:
-            task["status"] = "error"
-            task["error"] = str(exc)
-
-    threading.Thread(target=worker, name=task_id, daemon=True).start()
-    return jsonify({"taskId": task_id, "status": "running"}), 202
+    text = data.get("text", "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    target = data.get("target", "zh-CN")
+    source = data.get("source", "auto")
+    try:
+        if data.get("batch"):
+            texts = data.get("texts", [text])
+            results = translation_service.translate_batch(texts, target, source)
+            return jsonify({"results": results, "count": len(results)})
+        result = translation_service.translate(text, target, source)
+        return jsonify(result)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        return jsonify({"error": f"Translation failed: {exc}"}), 500
 
 
-@app.route("/api/translate/chapter", methods=["POST"])
-def api_translate_chapter():
-    data = request.get_json(silent=True) or {}
-    novel_id = data.get("novelId")
-    chapter_index = data.get("chapterIndex")
-    if not novel_id or chapter_index is None:
-        return jsonify({"error": "novelId and chapterIndex are required"}), 400
-    body, status = translation_service.translate_chapter(
-        novel_id,
-        int(chapter_index),
-        data.get("source", "auto"),
-        data.get("target", "zh-cn"),
-    )
-    return jsonify(body), status
-
-
-@app.route("/api/translate/tasks/<task_id>", methods=["GET"])
-def api_translate_task(task_id: str):
-    task = translation_service.task_status(task_id)
-    if not task:
-        return jsonify({"error": "task not found"}), 404
-    return jsonify(task)
-
-
-@app.route("/api/translate/novel/<novel_id>", methods=["POST"])
-def api_translate_novel(novel_id: str):
-    novel = novel_manager.get(novel_id)
-    if not novel:
-        return jsonify({"error": "novel not found"}), 404
-    data = request.get_json(silent=True) or {}
-    task_ids = []
-    for chapter in novel["chapters"]:
-        result, _status = translation_service.translate_chapter(
-            novel_id,
-            int(chapter["index"]),
-            data.get("source", "auto"),
-            data.get("target", "zh-cn"),
-        )
-        if result.get("taskId"):
-            task_ids.append(result["taskId"])
-    return jsonify({"success": True, "taskIds": task_ids})
+@app.route("/api/languages", methods=["GET"])
+def api_languages():
+    """Return supported target languages for translation."""
+    return jsonify({
+        "languages": [
+            {"code": "zh-CN", "name": "简体中文"},
+            {"code": "zh-TW", "name": "繁体中文"},
+            {"code": "en", "name": "English"},
+            {"code": "ja", "name": "日本語"},
+            {"code": "ko", "name": "한국어"},
+            {"code": "fr", "name": "Français"},
+            {"code": "de", "name": "Deutsch"},
+            {"code": "es", "name": "Español"},
+            {"code": "ru", "name": "Русский"},
+            {"code": "th", "name": "ไทย"},
+            {"code": "vi", "name": "Tiếng Việt"},
+        ]
+    })
 
 
 @app.route("/api/settings", methods=["GET"])
@@ -877,4 +1013,4 @@ if __name__ == "__main__":
     print("Novel reader backend starting")
     print(f"Storage: {NOVELS_DIR}")
     print(f"URL: http://localhost:{port}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)

@@ -23,8 +23,8 @@ import argparse
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
 
-# 修复 Windows 终端编码问题
-if sys.platform == 'win32':
+# Fix Windows console encoding - only when run directly (not when imported by Flask)
+if sys.platform == 'win32' and __name__ == '__main__':
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
@@ -51,6 +51,12 @@ RETRY_TIMES = 3
 RETRY_DELAY = 2
 CHAPTER_DELAY = 1  # 每章间隔，避免被封
 
+# 持久化 Session，支持 Cookie 保持（如 syosetu 年龄验证）
+_session = requests.Session()
+_session.headers.update(HEADERS)
+# 预置 syosetu 年龄验证 cookie（novel18.syosetu.com 需要）
+_session.cookies.set('over18', 'yes', domain='.syosetu.com', path='/')
+
 
 # ===================== 基础工具 =====================
 
@@ -76,10 +82,10 @@ def parse_url(base, href):
 
 
 def fetch(url, encoding=None):
-    """获取页面内容，带重试机制"""
+    """获取页面内容，带重试机制（使用持久化 Session）"""
     for attempt in range(RETRY_TIMES):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            resp = _session.get(url, timeout=TIMEOUT)
             resp.raise_for_status()
 
             if encoding:
@@ -142,6 +148,7 @@ class BiqugeStyleParser(BaseParser):
         'biquge', 'xbiquge', 'qubook', '69shu', '69xsw',
         'shuquge', 'uuks', 'bqg', 'qula', 'hetushu',
         'lingdian', 'quanshu', 'bxwx', 'zwdu',
+        'biqubao', 'bqgka', 'bqg2', 'bqg99',
     ]
 
     def get_title(self, soup, url):
@@ -266,6 +273,80 @@ class BiqugeStyleParser(BaseParser):
         return '\n'.join(lines) if lines else text
 
 
+class SyosetuParser(BaseParser):
+    """「小説家になろう」系サイト解析器（syosetu.com / novel18.syosetu.com）"""
+    SITE_NAME = "Syosetu/Nocuturn"
+    SITE_DOMAINS = [
+        'syosetu.com', 'novel18.syosetu.com',
+    ]
+
+    def get_title(self, soup, url):
+        meta = soup.find('meta', property='og:title')
+        if meta and meta.get('content'):
+            return meta['content'].strip()
+        h1 = soup.find('h1')
+        if h1:
+            return h1.get_text(strip=True)
+        return "未知书名"
+
+    def get_author(self, soup):
+        # syosetu 作者信息在 <p class="c-announce"> 中 "作者：xxx"
+        announce = soup.find('p', class_='c-announce')
+        if announce:
+            text = announce.get_text(strip=True)
+            import re
+            m = re.search(r'作者[：:]\s*(\S+)', text)
+            if m:
+                return m.group(1).strip()
+        meta = soup.find('meta', property='og:author')
+        if meta and meta.get('content'):
+            return meta['content'].strip()
+        return ""
+
+    def parse_chapter_list(self, soup, url):
+        chapters = []
+        seen = set()
+
+        # syosetu 章节列表在 div.p-eplist__sublist > a
+        for sublist in soup.find_all('div', class_='p-eplist__sublist'):
+            a = sublist.find('a', href=True)
+            if not a:
+                continue
+            href = a.get('href', '').strip()
+            text = a.get_text(strip=True)
+            if not text or not href or href.startswith('#'):
+                continue
+
+            full_url = parse_url(url, href)
+            if full_url and full_url not in seen:
+                seen.add(full_url)
+                chapters.append(Chapter(text, full_url, len(chapters)))
+
+        # Note: syosetu 目录页已是正序（第1章在前）
+        for i, ch in enumerate(chapters):
+            ch.index = i
+
+        return chapters
+
+    def parse_content(self, soup, url):
+        # syosetu 正文在 div.p-novel__body > div.p-novel__text > p
+        body = soup.find('div', class_='p-novel__body')
+        if not body:
+            return ""
+
+        paragraphs = []
+        for text_div in body.find_all('div', class_='p-novel__text'):
+            # 跳过后记
+            if 'p-novel__text--afterword' in text_div.get('class', []):
+                continue
+            for p in text_div.find_all('p'):
+                text = p.get_text(strip=True)
+                if text:
+                    paragraphs.append(text)
+
+        return '\n'.join(paragraphs) if paragraphs else ""
+
+
 class CustomParser(BaseParser):
     """自定义规则解析器 - 通过指定CSS选择器来解析"""
     SITE_NAME = "自定义"
@@ -315,6 +396,7 @@ class NovelCrawler:
     def __init__(self):
         self.parsers = [
             BiqugeStyleParser(),
+            SyosetuParser(),
         ]
         self.novel_title = ""
         self.novel_author = ""
