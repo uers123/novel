@@ -10,7 +10,6 @@ const App = (() => {
     _bindTabs();
     _bindImportEvents();
     _bindMenuEvents();
-    _bindTranslationEvents();
     await _loadNovels();
     if (_novels.length === 0) _loadLocalBooks();
     renderBookshelf();
@@ -218,12 +217,6 @@ const App = (() => {
       if (event.target === menuModal) menuModal.classList.remove('active');
     });
 
-    document.getElementById('menu-translate').addEventListener('click', () => {
-      menuModal.classList.remove('active');
-      document.getElementById('translation-modal').classList.add('active');
-      _prepareTranslation();
-    });
-
     document.getElementById('menu-export').addEventListener('click', () => {
       menuModal.classList.remove('active');
       _exportCurrentChapter();
@@ -231,7 +224,7 @@ const App = (() => {
 
     document.getElementById('menu-info').addEventListener('click', () => {
       menuModal.classList.remove('active');
-      alert('AI 有声小说阅读器\n支持阅读、后端TTS朗读、URL爬取和本地模型翻译。');
+      alert('AI 有声小说阅读器\n支持阅读、后端TTS朗读和URL爬取。');
     });
 
     document.getElementById('menu-delete').addEventListener('click', async () => {
@@ -256,64 +249,6 @@ const App = (() => {
     link.download = `${title}.txt`;
     link.click();
     URL.revokeObjectURL(url);
-  }
-
-  function _bindTranslationEvents() {
-    const modal = document.getElementById('translation-modal');
-    document.getElementById('translation-close').addEventListener('click', () => modal.classList.remove('active'));
-    modal.addEventListener('click', event => {
-      if (event.target === modal) modal.classList.remove('active');
-    });
-    document.getElementById('trans-btn-start').addEventListener('click', _doTranslation);
-  }
-
-  function _prepareTranslation() {
-    const text = Reader.getCurrentChapterText();
-    document.getElementById('trans-original').textContent = text.substring(0, 700) + (text.length > 700 ? '...' : '');
-    document.getElementById('trans-result').textContent = '点击“翻译”开始';
-  }
-
-  async function _doTranslation() {
-    const state = Reader.getState();
-    const resultBox = document.getElementById('trans-result');
-    resultBox.textContent = '正在提交本地模型翻译任务...';
-    try {
-      const response = await fetch('/api/translate/chapter', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          novelId: state.bookId,
-          chapterIndex: state.chapterIndex,
-          source: document.getElementById('trans-source-lang').value,
-          target: document.getElementById('trans-target-lang').value,
-          engine: 'nocle',
-        }),
-      });
-      const data = await response.json();
-      if (response.status === 200 && data.translated) {
-        resultBox.textContent = data.translated;
-        return;
-      }
-      if (!response.ok && !data.taskId) throw new Error(data.error || '翻译任务创建失败');
-      await _pollTranslation(data.taskId, resultBox);
-    } catch (error) {
-      resultBox.textContent = error.message || '翻译失败';
-    }
-  }
-
-  async function _pollTranslation(taskId, resultBox) {
-    for (let i = 0; i < 240; i += 1) {
-      const response = await fetch(`/api/translate/tasks/${taskId}`);
-      const task = await response.json();
-      if (task.status === 'complete') {
-        resultBox.textContent = task.result.translated;
-        return;
-      }
-      if (task.status === 'error') throw new Error(task.error || '翻译失败');
-      resultBox.textContent = `本地模型翻译中... ${task.progress || 0}%`;
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-    throw new Error('翻译超时');
   }
 
   function _escapeHtml(text) {

@@ -5,8 +5,7 @@ Features:
 - TXT import and URL catalog import.
 - Lazy chapter crawling with background prefetch.
 - Chapter progress and reader settings persistence.
-- Local TTS service adapter, designed for MeloTTS.
-- Local LLM translation task adapter, designed for the nocle GGUF model.
+- Local TTS service adapter, designed for ChatTTS.
 """
 
 from __future__ import annotations
@@ -46,9 +45,6 @@ PROJECT_DIR = BASE_DIR.parent
 NOVELS_DIR = BASE_DIR / "novels"
 SETTINGS_FILE = BASE_DIR / "settings.json"
 TTS_CACHE_DIR = BASE_DIR / "tts_cache"
-NOCLE_DIR = PROJECT_DIR / "nocle"
-NOCLE_MODELS_DIR = NOCLE_DIR / "models"
-
 DEFAULT_SETTINGS = {
     "theme": "day",
     "fontSize": 20,
@@ -57,7 +53,6 @@ DEFAULT_SETTINGS = {
     "pageEffect": "updown",
     "brightness": 100,
     "voiceId": "qinglang_male",
-    "autoRead": False,
 }
 
 app = Flask(__name__, static_folder=str(PROJECT_DIR), static_url_path="")
@@ -80,7 +75,19 @@ def write_json(path: Path, data: Any) -> None:
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp.replace(path)
+        # Retry replace on Windows to handle transient locks (antivirus, etc.)
+        for attempt in range(3):
+            try:
+                tmp.replace(path)
+                break
+            except OSError:
+                if attempt < 2:
+                    import time
+                    time.sleep(0.05 * (attempt + 1))
+                else:
+                    # Last resort: delete destination first, then rename
+                    path.unlink(missing_ok=True)
+                    tmp.replace(path)
     finally:
         # Clean up tmp file if replace failed and it still exists
         if tmp.exists():
@@ -114,6 +121,20 @@ def chunk_text(text: str, max_chars: int = 2200) -> list[str]:
     if current:
         chunks.append(current)
     return chunks or ([text] if text else [])
+
+
+def _read_file_with_fallback_encoding(path: str) -> str:
+    """Read a text file trying multiple encodings (UTF-8 → GBK → GB2312 → ascii)."""
+    encodings = ["utf-8", "gbk", "gb2312", "utf-16", "ascii"]
+    for enc in encodings:
+        try:
+            with open(path, "r", encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    # Last resort: read with errors='replace'
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
 
 
 class NovelManager:
@@ -233,8 +254,7 @@ class NovelManager:
         novel_path = self._novel_path(novel_id)
         novel_path.mkdir(parents=True, exist_ok=True)
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
+        text = _read_file_with_fallback_encoding(file_path)
 
         if not title:
             title = Path(file_path).stem.replace("_", " ").replace("-", " ")
@@ -666,131 +686,8 @@ class TTSService:
         return results
 
 
-class TranslationService:
-    def __init__(self):
-        self._llm = None
-        self._llm_error: str | None = None
-        self._lock = threading.Lock()
-        self._tasks: dict[str, dict[str, Any]] = {}
-
-    def _translation_path(self, novel_id: str, chapter_index: int, target: str) -> Path:
-        return novel_manager._novel_path(novel_id) / "translations" / f"chapter_{chapter_index}_{target}.txt"
-
-    def _load_llm(self):
-        if self._llm is not None:
-            return self._llm
-        if self._llm_error:
-            raise RuntimeError(self._llm_error)
-        try:
-            from llama_cpp import Llama
-
-            model_files = sorted(NOCLE_MODELS_DIR.glob("*.gguf"))
-            if not model_files:
-                raise FileNotFoundError(f"No .gguf model found in {NOCLE_MODELS_DIR}")
-            with self._lock:
-                if self._llm is None:
-                    self._llm = Llama(
-                        model_path=str(model_files[0]),
-                        n_gpu_layers=-1,
-                        n_ctx=8192,
-                        n_batch=512,
-                        verbose=False,
-                    )
-            return self._llm
-        except Exception as exc:
-            self._llm_error = (
-                "nocle translation engine is unavailable. Install llama-cpp-python "
-                f"and verify the GGUF model. Details: {exc}"
-            )
-            raise RuntimeError(self._llm_error) from exc
-
-    def _prompt(self, source: str, target: str, chunk: str) -> str:
-        system = (
-            "You are a professional literary translator. Translate faithfully. "
-            "Keep paragraph breaks, names, punctuation style, and do not continue or summarize the story."
-        )
-        user = f"Source language: {source}\nTarget language: {target}\n\nText:\n{chunk}"
-        return (
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-            f"{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
-            f"{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        )
-
-    def _translate_text(self, text: str, source: str, target: str, task: dict[str, Any]) -> str:
-        llm = self._load_llm()
-        chunks = chunk_text(text)
-        outputs: list[str] = []
-        for index, chunk in enumerate(chunks):
-            task["progress"] = int((index / max(1, len(chunks))) * 90)
-            response = llm(
-                self._prompt(source, target, chunk),
-                max_tokens=min(4096, max(512, int(len(chunk) * 1.8))),
-                temperature=0.2,
-                top_p=0.9,
-                repeat_penalty=1.1,
-                stop=["<|eot_id|>"],
-            )
-            outputs.append(response["choices"][0]["text"].strip())
-        task["progress"] = 95
-        return "\n\n".join(outputs)
-
-    def translate_chapter(self, novel_id: str, chapter_index: int, source: str, target: str) -> tuple[dict[str, Any], int]:
-        chapter = novel_manager.get_chapter(novel_id, chapter_index)
-        if not chapter:
-            return {"error": "chapter not found"}, 404
-
-        cache_path = self._translation_path(novel_id, chapter_index, target)
-        if cache_path.exists():
-            with open(cache_path, "r", encoding="utf-8") as f:
-                return {
-                    "cached": True,
-                    "novelId": novel_id,
-                    "chapterIndex": chapter_index,
-                    "target": target,
-                    "translated": f.read(),
-                }, 200
-
-        task_id = f"trans_{novel_id}_{chapter_index}_{uuid.uuid4().hex[:8]}"
-        task = {
-            "taskId": task_id,
-            "status": "running",
-            "progress": 0,
-            "novelId": novel_id,
-            "chapterIndex": chapter_index,
-            "target": target,
-            "error": None,
-            "result": None,
-        }
-        self._tasks[task_id] = task
-
-        def worker() -> None:
-            try:
-                translated = self._translate_text(chapter["content"], source, target, task)
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    f.write(translated)
-                task["status"] = "complete"
-                task["progress"] = 100
-                task["result"] = {
-                    "novelId": novel_id,
-                    "chapterIndex": chapter_index,
-                    "target": target,
-                    "translated": translated,
-                }
-            except Exception as exc:
-                task["status"] = "error"
-                task["error"] = str(exc)
-
-        threading.Thread(target=worker, name=task_id, daemon=True).start()
-        return {"cached": False, "taskId": task_id, "status": "running"}, 202
-
-    def task_status(self, task_id: str) -> dict[str, Any] | None:
-        return self._tasks.get(task_id)
-
-
 novel_manager = NovelManager(NOVELS_DIR)
 tts_service = TTSService(TTS_CACHE_DIR)
-translation_service = TranslationService()
 
 
 @app.route("/")
@@ -939,78 +836,6 @@ def api_tts_synthesize_batch():
 @app.route("/api/tts/audio/<path:filename>", methods=["GET"])
 def api_tts_audio(filename: str):
     return send_from_directory(str(TTS_CACHE_DIR), filename)
-
-
-@app.route("/api/translate", methods=["POST"])
-def api_translate_text():
-    data = request.get_json(silent=True) or {}
-    text = data.get("text", "")
-    if not text.strip():
-        return jsonify({"result": ""})
-    task_id = f"text_{uuid.uuid4().hex[:8]}"
-    task = {"taskId": task_id, "status": "running", "progress": 0, "result": None, "error": None}
-    translation_service._tasks[task_id] = task
-
-    def worker() -> None:
-        try:
-            translated = translation_service._translate_text(
-                text,
-                data.get("source", "auto"),
-                data.get("target", "zh-cn"),
-                task,
-            )
-            task["status"] = "complete"
-            task["progress"] = 100
-            task["result"] = {"translated": translated}
-        except Exception as exc:
-            task["status"] = "error"
-            task["error"] = str(exc)
-
-    threading.Thread(target=worker, name=task_id, daemon=True).start()
-    return jsonify({"taskId": task_id, "status": "running"}), 202
-
-
-@app.route("/api/translate/chapter", methods=["POST"])
-def api_translate_chapter():
-    data = request.get_json(silent=True) or {}
-    novel_id = data.get("novelId")
-    chapter_index = data.get("chapterIndex")
-    if not novel_id or chapter_index is None:
-        return jsonify({"error": "novelId and chapterIndex are required"}), 400
-    body, status = translation_service.translate_chapter(
-        novel_id,
-        int(chapter_index),
-        data.get("source", "auto"),
-        data.get("target", "zh-cn"),
-    )
-    return jsonify(body), status
-
-
-@app.route("/api/translate/tasks/<task_id>", methods=["GET"])
-def api_translate_task(task_id: str):
-    task = translation_service.task_status(task_id)
-    if not task:
-        return jsonify({"error": "task not found"}), 404
-    return jsonify(task)
-
-
-@app.route("/api/translate/novel/<novel_id>", methods=["POST"])
-def api_translate_novel(novel_id: str):
-    novel = novel_manager.get(novel_id)
-    if not novel:
-        return jsonify({"error": "novel not found"}), 404
-    data = request.get_json(silent=True) or {}
-    task_ids = []
-    for chapter in novel["chapters"]:
-        result, _status = translation_service.translate_chapter(
-            novel_id,
-            int(chapter["index"]),
-            data.get("source", "auto"),
-            data.get("target", "zh-cn"),
-        )
-        if result.get("taskId"):
-            task_ids.append(result["taskId"])
-    return jsonify({"success": True, "taskIds": task_ids})
 
 
 @app.route("/api/settings", methods=["GET"])

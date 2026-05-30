@@ -193,15 +193,12 @@ const AudioPlayer = (() => {
   async function _playCurrentSentence() {
     if (!_isPlaying) return;
 
-    // Check auto-read: when reaching end of chapter
     if (_sentenceIndex >= _sentences.length) {
       _setInfo('本章朗读完成');
       _isPlaying = false;
       _isPrefetching = false;
       Reader.clearHighlight();
       _updateUI();
-      // Auto-advance to next chapter if auto-read is enabled
-      _autoNextChapter();
       return;
     }
 
@@ -275,28 +272,6 @@ const AudioPlayer = (() => {
       // prefetch failure is non-critical
     } finally {
       _isPrefetching = false;
-    }
-  }
-
-  function _autoNextChapter() {
-    // Check if auto-read is enabled in settings
-    try {
-      const settings = JSON.parse(localStorage.getItem('novel_settings') || '{}');
-      if (!settings.autoRead) return;
-    } catch (_e) {
-      return;
-    }
-
-    // Advance to next chapter
-    const state = Reader.getState();
-    if (state.chapterIndex < state.chapters.length - 1) {
-      _setInfo('自动进入下一章...');
-      setTimeout(() => {
-        Reader.nextChapter();
-        // show() will be triggered by reader:chapter-loaded event
-      }, 800);
-    } else {
-      _setInfo('全书朗读完成');
     }
   }
 

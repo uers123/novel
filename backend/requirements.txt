@@ -3,13 +3,10 @@ flask-cors>=4.0
 requests>=2.28
 beautifulsoup4>=4.11
 
-# Optional runtime adapters:
-# ChatTTS provides backend local TTS with multi-speaker & emotion support.
+# ChatTTS for local TTS with multi-speaker & emotion support.
 # Install: pip install ChatTTS torch torchaudio soundfile transformers==4.41.0
-# llama-cpp-python provides nocle GGUF translation. Install the CUDA/CPU wheel that matches the machine.
 # ChatTTS
 # torch
 # torchaudio
 # soundfile
 # transformers==4.41.0
-# llama-cpp-python

@@ -8,7 +8,6 @@ const Settings = (() => {
     colorPalette: $('color-palette'),
     effectOptions: $('page-effect-options'),
     eyeCare: $('set-eye-care'),
-    autoRead: $('set-auto-read'),
     readerContent: $('reader-content'),
     nightBtn: $('nav-night'),
   };
@@ -20,7 +19,6 @@ const Settings = (() => {
     bgColor: '#F6F3EC',
     pageEffect: 'updown',
     brightness: 100,
-    autoRead: false,
     voiceId: 'qinglang_male',
   };
   let _hasLocalSettings = false;
@@ -59,10 +57,6 @@ const Settings = (() => {
 
     els.eyeCare.addEventListener('click', () => {
       set('theme', _settings.theme === 'eye' ? 'day' : 'eye');
-    });
-
-    els.autoRead.addEventListener('click', () => {
-      set('autoRead', !_settings.autoRead);
     });
 
     els.nightBtn.addEventListener('click', () => {
@@ -112,7 +106,7 @@ const Settings = (() => {
   }
 
   function _applyAll() {
-    ['theme', 'fontSize', 'lineHeight', 'bgColor', 'brightness', 'pageEffect', 'autoRead'].forEach(_apply);
+    ['theme', 'fontSize', 'lineHeight', 'bgColor', 'brightness', 'pageEffect'].forEach(_apply);
     _syncUI();
   }
 
@@ -146,9 +140,6 @@ const Settings = (() => {
       els.effectOptions.querySelectorAll('.effect-option').forEach(item => {
         item.classList.toggle('active', item.dataset.effect === _settings.pageEffect);
       });
-    }
-    if (key === 'autoRead') {
-      els.autoRead.classList.toggle('active', Boolean(_settings.autoRead));
     }
   }
 
