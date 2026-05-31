@@ -1,0 +1,12 @@
+flask>=3.0
+flask-cors>=4.0
+requests>=2.28
+beautifulsoup4>=4.11
+
+# ChatTTS for local TTS with multi-speaker & emotion support.
+# Install: pip install ChatTTS torch torchaudio soundfile transformers==4.41.0
+# ChatTTS
+# torch
+# torchaudio
+# soundfile
+# transformers==4.41.0
