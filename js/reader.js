@@ -33,6 +33,7 @@ const Reader = (() => {
   function _loadChapter(index) {
     if (_isLoading || !_chapters.length || index < 0 || index >= _chapters.length) return;
     _isLoading = true;
+    const previousIndex = _currentChapterIndex;
     _currentChapterIndex = index;
 
     const chapter = _chapters[index];
@@ -46,11 +47,13 @@ const Reader = (() => {
     _fetchChapterContent(index)
       .then(content => {
         _renderContent(content);
+        _runPageEffect(index >= previousIndex ? 'next' : 'prev');
         _saveProgress(index);
         document.dispatchEvent(new CustomEvent('reader:chapter-loaded', { detail: getState() }));
       })
       .catch(() => {
         _renderContent(_getLocalContent(index));
+        _runPageEffect(index >= previousIndex ? 'next' : 'prev');
         _saveProgress(index);
       })
       .finally(() => {
@@ -98,6 +101,33 @@ const Reader = (() => {
 
     els.chapterText.innerHTML = html;
     els.view.querySelector('.reader-content').scrollTop = 0;
+  }
+
+  function _runPageEffect(direction) {
+    const settings = typeof Settings !== 'undefined' ? Settings.get() : {};
+    const effect = settings.pageEffect || 'updown';
+    els.chapterText.classList.remove(
+      'page-transition',
+      'page-effect-push',
+      'page-effect-cover',
+      'page-effect-simulation',
+      'page-effect-updown',
+      'page-direction-next',
+      'page-direction-prev',
+    );
+    void els.chapterText.offsetWidth;
+    els.chapterText.classList.add('page-transition', `page-effect-${effect}`, `page-direction-${direction}`);
+    window.setTimeout(() => {
+      els.chapterText.classList.remove(
+        'page-transition',
+        'page-effect-push',
+        'page-effect-cover',
+        'page-effect-simulation',
+        'page-effect-updown',
+        'page-direction-next',
+        'page-direction-prev',
+      );
+    }, 360);
   }
 
   function _splitSentences(text) {

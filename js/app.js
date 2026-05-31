@@ -1,6 +1,8 @@
 const App = (() => {
   let _novels = [];
   window._currentNovel = null;
+  const CHUNK_THRESHOLD = 2 * 1024 * 1024;
+  const CHUNK_SIZE = 2 * 1024 * 1024;
 
   async function init() {
     Settings.init();
@@ -156,7 +158,11 @@ const App = (() => {
         const response = await fetch('/api/novels/import-url', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, prefetchChapters: 100 }),
+          body: JSON.stringify({
+            url,
+            prefetchChapters: 100,
+            sourceType: document.getElementById('crawl-source').value,
+          }),
         });
         let data;
         try {
@@ -192,10 +198,19 @@ const App = (() => {
     const fileInput = document.getElementById('file-input');
     if (!fileInput.files.length) return;
 
+    const file = fileInput.files[0];
+    const title = document.getElementById('import-title').value.trim() || '未命名小说';
+    const author = document.getElementById('import-author').value.trim();
+
+    if (file.size > CHUNK_THRESHOLD) {
+      await _doChunkedImport(file, title, author);
+      return;
+    }
+
     const formData = new FormData();
-    formData.append('file', fileInput.files[0]);
-    formData.append('title', document.getElementById('import-title').value.trim() || '未命名小说');
-    formData.append('author', document.getElementById('import-author').value.trim());
+    formData.append('file', file);
+    formData.append('title', title);
+    formData.append('author', author);
 
     try {
       const response = await fetch('/api/novels/import', { method: 'POST', body: formData });
@@ -209,6 +224,58 @@ const App = (() => {
       document.getElementById('import-modal').classList.remove('active');
     } catch (error) {
       alert(error.message || '导入失败');
+    }
+  }
+
+  async function _doChunkedImport(file, title, author) {
+    const submit = document.getElementById('import-submit');
+    const originalText = submit.textContent;
+    let uploadId = null;
+    submit.disabled = true;
+    try {
+      const startResponse = await fetch('/api/novels/import/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, title, author, totalSize: file.size, chunkSize: CHUNK_SIZE }),
+      });
+      const startData = await startResponse.json();
+      if (!startResponse.ok) throw new Error(startData.error || '无法开始分块上传');
+      uploadId = startData.uploadId;
+
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+      for (let index = 0; index < totalChunks; index += 1) {
+        const formData = new FormData();
+        formData.append('uploadId', uploadId);
+        formData.append('chunkIndex', String(index));
+        formData.append('chunk', file.slice(index * CHUNK_SIZE, Math.min(file.size, (index + 1) * CHUNK_SIZE)));
+        submit.textContent = `上传中 ${index + 1}/${totalChunks}`;
+        const chunkResponse = await fetch('/api/novels/import/chunk', { method: 'POST', body: formData });
+        const chunkData = await chunkResponse.json();
+        if (!chunkResponse.ok) throw new Error(chunkData.error || `分块 ${index + 1} 上传失败`);
+      }
+
+      submit.textContent = '正在合并...';
+      const completeResponse = await fetch('/api/novels/import/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uploadId, title, author }),
+      });
+      const completeData = await completeResponse.json();
+      if (!completeResponse.ok) throw new Error(completeData.error || '导入失败');
+      await _loadNovels();
+      renderBookshelf();
+      document.getElementById('file-input').value = '';
+      document.getElementById('upload-form').style.display = 'none';
+      document.getElementById('upload-zone').style.display = 'block';
+      document.getElementById('import-modal').classList.remove('active');
+    } catch (error) {
+      if (uploadId) {
+        fetch(`/api/novels/import/${uploadId}`, { method: 'DELETE' }).catch(() => {});
+      }
+      alert(error.message || '导入失败');
+    } finally {
+      submit.disabled = false;
+      submit.textContent = originalText;
     }
   }
 
@@ -276,6 +343,11 @@ const App = (() => {
         document.getElementById('translate-chapter-btn').click();
       }
     });
+    document.addEventListener('reader:chapter-loaded', () => {
+      if (document.getElementById('translate-auto').checked && modal.classList.contains('active')) {
+        _translateCurrentChapter();
+      }
+    });
   }
 
   function _openTranslatePanel() {
@@ -284,8 +356,8 @@ const App = (() => {
   }
 
   async function _translateCurrentChapter() {
-    const text = Reader.getCurrentChapterText();
-    if (!text) {
+    const state = Reader.getState();
+    if (!state.bookId) {
       document.getElementById('translate-result').textContent = '没有可翻译的文本';
       return;
     }
@@ -293,14 +365,19 @@ const App = (() => {
     document.getElementById('translate-result').textContent = '翻译中...';
 
     try {
-      const response = await fetch('/api/translate', {
+      const response = await fetch('/api/translate/chapter', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, target, source: 'auto' }),
+        body: JSON.stringify({
+          novelId: state.bookId,
+          chapterIndex: state.chapterIndex,
+          target,
+          source: 'auto',
+        }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '翻译失败');
-      document.getElementById('translate-result').textContent = data.text || '(空结果)';
+      document.getElementById('translate-result').textContent = data.translated || data.text || '(空结果)';
     } catch (error) {
       document.getElementById('translate-result').textContent = `翻译失败：${error.message}`;
     }

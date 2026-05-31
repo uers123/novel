@@ -45,6 +45,8 @@ PROJECT_DIR = BASE_DIR.parent
 NOVELS_DIR = BASE_DIR / "novels"
 SETTINGS_FILE = BASE_DIR / "settings.json"
 TTS_CACHE_DIR = BASE_DIR / "tts_cache"
+UPLOADS_DIR = BASE_DIR / "uploads"
+CHUNK_SIZE = 2 * 1024 * 1024
 DEFAULT_SETTINGS = {
     "theme": "day",
     "fontSize": 20,
@@ -53,45 +55,61 @@ DEFAULT_SETTINGS = {
     "pageEffect": "updown",
     "brightness": 100,
     "voiceId": "qinglang_male",
+    "emotion": "auto",
 }
 
 app = Flask(__name__, static_folder=str(PROJECT_DIR), static_url_path="")
 CORS(app)
 
+_JSON_LOCKS: dict[str, threading.RLock] = {}
+_JSON_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _JSON_LOCKS_GUARD:
+        lock = _JSON_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _JSON_LOCKS[key] = lock
+        return lock
+
 
 def read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with _path_lock(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
 
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Use unique tmp name to avoid race conditions across threads
-    import threading
-    tid = threading.get_ident()
-    tmp = path.with_suffix(path.suffix + f".tmp.{tid}")
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        # Retry replace on Windows to handle transient locks (antivirus, etc.)
-        for attempt in range(3):
-            try:
-                tmp.replace(path)
-                break
-            except OSError:
-                if attempt < 2:
-                    import time
+    lock = _path_lock(path)
+    with lock:
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            last_error: OSError | None = None
+            for attempt in range(8):
+                try:
+                    os.replace(tmp, path)
+                    return
+                except OSError as exc:
+                    last_error = exc
                     time.sleep(0.05 * (attempt + 1))
-                else:
-                    # Last resort: delete destination first, then rename
-                    path.unlink(missing_ok=True)
-                    tmp.replace(path)
-    finally:
-        # Clean up tmp file if replace failed and it still exists
-        if tmp.exists():
-            tmp.unlink()
+
+            try:
+                path.unlink(missing_ok=True)
+                os.replace(tmp, path)
+            except OSError as exc:
+                raise last_error or exc
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def split_sentences(text: str) -> list[str]:
@@ -328,8 +346,17 @@ class NovelManager:
             self._save_index()
         return {"id": novel_id, **meta}
 
-    def import_from_crawl(self, url: str, title: str | None = None, prefetch_chapters: int = 100) -> dict[str, Any]:
-        crawler = self._new_crawler()
+    def import_from_crawl(
+        self,
+        url: str,
+        title: str | None = None,
+        prefetch_chapters: int = 100,
+        source_type: str = "auto",
+    ) -> dict[str, Any]:
+        try:
+            crawler = self._new_crawler(source_type)
+        except TypeError:
+            crawler = self._new_crawler()
         if not crawler.fetch_novel_info(url):
             raise ValueError("Unable to parse the catalog URL.")
 
@@ -374,13 +401,19 @@ class NovelManager:
 
         return {"id": novel_id, **meta}
 
-    def _new_crawler(self):
+    def _new_crawler(self, source_type: str = "auto"):
         crawler_path = str(PROJECT_DIR / "ASD")
         if crawler_path not in sys.path:
             sys.path.insert(0, crawler_path)
         from novel_crawler import NovelCrawler
 
-        return NovelCrawler()
+        try:
+            return NovelCrawler(preferred_source=source_type)
+        except TypeError:
+            crawler = NovelCrawler()
+            if hasattr(crawler, "set_preferred_source"):
+                crawler.set_preferred_source(source_type)
+            return crawler
 
     def _crawl_chapter(self, novel_id: str, chapter_index: int) -> bool:
         chapters = self._read_chapters(novel_id)
@@ -503,9 +536,10 @@ class TTSService:
         # GPU / VRAM settings (can be updated via API)
         self.gpu = {
             "maxBatchSize": 5,
-            "useHalfPrecision": True,
+            "useHalfPrecision": False,
             "clearCache": True,
             "maxVRAM": 80,
+            "halfPrecisionFallback": False,
         }
 
         self.voices = [
@@ -571,8 +605,22 @@ class TTSService:
         return dict(self.gpu)
 
     def list_voices(self) -> list[dict[str, Any]]:
-        installed = self._chattts_available()
-        return [{**voice, "installed": installed} for voice in self.voices]
+        available = self._chattts_available()
+        return [{**voice, "installed": available, "available": available} for voice in self.voices]
+
+    def list_emotions(self) -> list[dict[str, str]]:
+        names = {
+            "auto": "自动识别",
+            "neutral": "平静",
+            "happy": "开心",
+            "sad": "悲伤",
+            "angry": "愤怒",
+            "surprise": "惊讶",
+        }
+        return [{"id": key, "name": names[key]} for key in ["auto", *self.emotions.keys()]]
+
+    def _mock_enabled(self) -> bool:
+        return os.environ.get("NOVEL_READER_MOCK_TTS", "").lower() in {"1", "true", "yes"}
 
     def _chattts_available(self) -> bool:
         if self._model_error:
@@ -652,7 +700,8 @@ class TTSService:
                             if hasattr(chat, 'model') and hasattr(chat.model, 'half'):
                                 chat.model = chat.model.half()
                         except Exception:
-                            pass
+                            self.gpu["useHalfPrecision"] = False
+                            self.gpu["halfPrecisionFallback"] = True
                     self._chat = chat
                     self._init_voice_embeddings()
                     self._clear_gpu_cache()
@@ -732,11 +781,25 @@ class TTSService:
         audio_path = self.cache_dir / f"{digest}.wav"
         if audio_path.exists():
             return {"cached": True, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
+        if self._mock_enabled():
+            return {"cached": False, "audioUrl": f"/api/tts/audio/mock-{digest}.wav", "mock": True}
         chat = self._load_model()
         import soundfile as sf
         prp, pic = self._tts_params(voice_id, rate, emotion)
-        with self._lock:
-            wavs = chat.infer([text], params_refine_text=prp, params_infer_code=pic, use_decoder=True)
+        try:
+            with self._lock:
+                wavs = chat.infer([text], params_refine_text=prp, params_infer_code=pic, use_decoder=True)
+        except RuntimeError as exc:
+            if self.gpu.get("useHalfPrecision") and "Half" in str(exc):
+                self.gpu["useHalfPrecision"] = False
+                self.gpu["halfPrecisionFallback"] = True
+                self._chat = None
+                chat = self._load_model()
+                prp, pic = self._tts_params(voice_id, rate, emotion)
+                with self._lock:
+                    wavs = chat.infer([text], params_refine_text=prp, params_infer_code=pic, use_decoder=True)
+            else:
+                raise
         sf.write(str(audio_path), wavs[0], 24000)
         self._clear_gpu_cache()
         return {"cached": False, "audioUrl": f"/api/tts/audio/{audio_path.name}"}
@@ -746,6 +809,8 @@ class TTSService:
         if not text:
             raise ValueError("text is required")
         voice_id = voice_id or "qinglang_male"
+        if emotion == "auto":
+            emotion = None
         emotion = emotion or self.detect_emotion(text)
         sentences = split_sentences(text)
         result = self._synthesize_one(text, voice_id, rate, emotion)
@@ -756,6 +821,8 @@ class TTSService:
         if not texts:
             return []
         voice_id = voice_id or "qinglang_male"
+        if emotion == "auto":
+            emotion = None
         results: list[dict[str, Any]] = [None] * len(texts)
         uncached: list[tuple[int, str, str, str]] = []
         for i, text in enumerate(texts):
@@ -768,6 +835,15 @@ class TTSService:
                 uncached.append((i, text, emo, digest))
         if not uncached:
             return results
+        if self._mock_enabled():
+            for orig_idx, _text, _emo, digest in uncached:
+                results[orig_idx] = {
+                    "index": orig_idx,
+                    "cached": False,
+                    "audioUrl": f"/api/tts/audio/mock-{digest}.wav",
+                    "mock": True,
+                }
+            return results
         chat = self._load_model()
         import soundfile as sf
         sub_batch_size = self._maybe_throttle_batch(len(uncached))
@@ -776,8 +852,20 @@ class TTSService:
             chunk_texts = [item[1] for item in chunk]
             batch_emo = chunk[0][2]
             prp, pic = self._tts_params(voice_id, rate, batch_emo)
-            with self._lock:
-                wavs = chat.infer(chunk_texts, params_refine_text=prp, params_infer_code=pic, use_decoder=True, split_text=False)
+            try:
+                with self._lock:
+                    wavs = chat.infer(chunk_texts, params_refine_text=prp, params_infer_code=pic, use_decoder=True, split_text=False)
+            except RuntimeError as exc:
+                if self.gpu.get("useHalfPrecision") and "Half" in str(exc):
+                    self.gpu["useHalfPrecision"] = False
+                    self.gpu["halfPrecisionFallback"] = True
+                    self._chat = None
+                    chat = self._load_model()
+                    prp, pic = self._tts_params(voice_id, rate, batch_emo)
+                    with self._lock:
+                        wavs = chat.infer(chunk_texts, params_refine_text=prp, params_infer_code=pic, use_decoder=True, split_text=False)
+                else:
+                    raise
             for (orig_idx, text, emo, digest), wav in zip(chunk, wavs):
                 audio_path = self.cache_dir / f"{digest}.wav"
                 sf.write(str(audio_path), wav, 24000)
@@ -879,6 +967,96 @@ def api_import_novel():
             temp_path.unlink()
 
 
+@app.route("/api/novels/import/start", methods=["POST"])
+def api_import_start():
+    data = request.get_json(silent=True) or {}
+    filename = Path(data.get("filename") or "upload.txt").name
+    if not filename.lower().endswith(".txt"):
+        return jsonify({"error": "TXT file is required"}), 400
+
+    upload_id = uuid.uuid4().hex
+    upload_dir = UPLOADS_DIR / upload_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "uploadId": upload_id,
+        "filename": filename,
+        "title": data.get("title") or Path(filename).stem,
+        "author": data.get("author", ""),
+        "totalSize": int(data.get("totalSize", 0) or 0),
+        "chunkSize": int(data.get("chunkSize", CHUNK_SIZE) or CHUNK_SIZE),
+        "createdAt": datetime.now().isoformat(),
+        "chunks": [],
+    }
+    write_json(upload_dir / "upload.json", meta)
+    return jsonify({"uploadId": upload_id, "chunkSize": meta["chunkSize"]}), 201
+
+
+@app.route("/api/novels/import/chunk", methods=["POST"])
+def api_import_chunk():
+    upload_id = request.form.get("uploadId", "")
+    chunk_index = request.form.get("chunkIndex", "")
+    if not upload_id or not chunk_index.isdigit() or "chunk" not in request.files:
+        return jsonify({"error": "uploadId, chunkIndex and chunk are required"}), 400
+
+    upload_dir = UPLOADS_DIR / upload_id
+    meta_path = upload_dir / "upload.json"
+    if not meta_path.exists():
+        return jsonify({"error": "upload not found"}), 404
+
+    index = int(chunk_index)
+    chunk_file = upload_dir / f"chunk_{index:08d}.part"
+    request.files["chunk"].save(str(chunk_file))
+
+    meta = read_json(meta_path, {})
+    chunks = set(int(item) for item in meta.get("chunks", []))
+    chunks.add(index)
+    meta["chunks"] = sorted(chunks)
+    write_json(meta_path, meta)
+    return jsonify({"success": True, "received": index})
+
+
+@app.route("/api/novels/import/complete", methods=["POST"])
+def api_import_complete():
+    data = request.get_json(silent=True) or {}
+    upload_id = data.get("uploadId", "")
+    upload_dir = UPLOADS_DIR / upload_id
+    meta_path = upload_dir / "upload.json"
+    if not meta_path.exists():
+        return jsonify({"error": "upload not found"}), 404
+
+    meta = read_json(meta_path, {})
+    chunk_files = sorted(upload_dir.glob("chunk_*.part"))
+    if not chunk_files:
+        return jsonify({"error": "no chunks uploaded"}), 400
+
+    assembled = upload_dir / meta.get("filename", "upload.txt")
+    with open(assembled, "wb") as out:
+        for expected, chunk_file in enumerate(chunk_files):
+            if chunk_file.name != f"chunk_{expected:08d}.part":
+                return jsonify({"error": f"missing chunk {expected}"}), 400
+            with open(chunk_file, "rb") as src:
+                shutil.copyfileobj(src, out)
+
+    try:
+        result = novel_manager.import_from_txt(
+            str(assembled),
+            title=data.get("title") or meta.get("title"),
+            author=data.get("author", meta.get("author", "")),
+        )
+        return jsonify({"success": True, "novel": result}), 201
+    finally:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+
+
+@app.route("/api/novels/import/<upload_id>", methods=["DELETE"])
+def api_import_cancel(upload_id: str):
+    upload_dir = UPLOADS_DIR / upload_id
+    if not upload_dir.exists():
+        return jsonify({"error": "upload not found"}), 404
+    shutil.rmtree(upload_dir, ignore_errors=True)
+    return jsonify({"success": True})
+
+
 @app.route("/api/novels/import-url", methods=["POST"])
 def api_import_from_url():
     data = request.get_json(silent=True) or {}
@@ -887,7 +1065,13 @@ def api_import_from_url():
         return jsonify({"error": "url is required"}), 400
     prefetch = int(data.get("prefetchChapters", 100))
     try:
-        result = novel_manager.import_from_crawl(url, title=data.get("title") or None, prefetch_chapters=prefetch)
+        source_type = data.get("sourceType") or data.get("source") or "auto"
+        result = novel_manager.import_from_crawl(
+            url,
+            title=data.get("title") or None,
+            prefetch_chapters=prefetch,
+            source_type=source_type,
+        )
         status = novel_manager.crawl_status(result["id"])
         return jsonify({"success": True, "novel": result, "crawlStatus": status}), 201
     except ValueError as exc:
@@ -930,6 +1114,11 @@ def api_update_progress(novel_id: str):
 @app.route("/api/tts/voices", methods=["GET"])
 def api_tts_voices():
     return jsonify({"voices": tts_service.list_voices()})
+
+
+@app.route("/api/tts/emotions", methods=["GET"])
+def api_tts_emotions():
+    return jsonify({"emotions": tts_service.list_emotions()})
 
 
 @app.route("/api/tts/synthesize", methods=["POST"])
@@ -1017,6 +1206,64 @@ def api_translate():
         return jsonify({"error": str(exc)}), 503
     except Exception as exc:
         return jsonify({"error": f"Translation failed: {exc}"}), 500
+
+
+@app.route("/api/translate/chapter", methods=["POST"])
+def api_translate_chapter():
+    data = request.get_json(silent=True) or {}
+    novel_id = data.get("novelId", "")
+    chapter_index = data.get("chapterIndex")
+    target = (data.get("target") or "zh-CN").lower()
+    source = data.get("source", "auto")
+    force = bool(data.get("force"))
+
+    if not novel_id or chapter_index is None:
+        return jsonify({"error": "novelId and chapterIndex are required"}), 400
+
+    chapter = novel_manager.get_chapter(novel_id, int(chapter_index))
+    if not chapter:
+        return jsonify({"error": "chapter not found"}), 404
+
+    translation_dir = novel_manager._novel_path(novel_id) / "translations"
+    translation_dir.mkdir(parents=True, exist_ok=True)
+    safe_target = re.sub(r"[^a-z0-9_-]+", "-", target)
+    cache_file = translation_dir / f"chapter_{int(chapter_index)}_{safe_target}.txt"
+    if cache_file.exists() and not force:
+        translated = cache_file.read_text(encoding="utf-8")
+        return jsonify({
+            "novelId": novel_id,
+            "chapterIndex": int(chapter_index),
+            "target": target,
+            "translated": translated,
+            "text": translated,
+            "cached": True,
+        })
+
+    try:
+        chunks = chunk_text(chapter.get("content", ""), max_chars=1800)
+        translated_chunks = [
+            translation_service.translate(chunk, target, source).get("text", "")
+            for chunk in chunks
+        ]
+        translated = "\n\n".join(item for item in translated_chunks if item)
+        cache_file.write_text(translated, encoding="utf-8")
+        return jsonify({
+            "novelId": novel_id,
+            "chapterIndex": int(chapter_index),
+            "target": target,
+            "translated": translated,
+            "text": translated,
+            "cached": False,
+        })
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        return jsonify({"error": f"Translation failed: {exc}"}), 500
+
+
+@app.route("/api/translate/tasks/<task_id>", methods=["GET"])
+def api_translate_task(task_id: str):
+    return jsonify({"error": "translation task not found", "taskId": task_id}), 404
 
 
 @app.route("/api/languages", methods=["GET"])

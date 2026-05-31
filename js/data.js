@@ -196,7 +196,8 @@ const Storage = {
       lineHeight: 1.8,     // 1.4-2.4
       bgColor: '#F9F7F4',  // 背景色
       pageEffect: 'updown', // push / cover / simulation / updown
-      brightness: 100       // 0-100
+      brightness: 100,      // 0-100
+      emotion: 'auto'
     };
   },
 

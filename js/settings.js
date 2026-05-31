@@ -20,6 +20,7 @@ const Settings = (() => {
     pageEffect: 'updown',
     brightness: 100,
     voiceId: 'qinglang_male',
+    emotion: 'auto',
   };
   let _hasLocalSettings = false;
 
@@ -34,6 +35,9 @@ const Settings = (() => {
   function _bindEvents() {
     document.getElementById('nav-settings').addEventListener('click', () => {
       els.modal.classList.add('active');
+    });
+    document.getElementById('settings-close').addEventListener('click', () => {
+      els.modal.classList.remove('active');
     });
     els.modal.addEventListener('click', event => {
       if (event.target === els.modal) els.modal.classList.remove('active');

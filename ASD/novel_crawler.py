@@ -393,21 +393,30 @@ class CustomParser(BaseParser):
 class NovelCrawler:
     """小说爬虫主引擎"""
 
-    def __init__(self):
+    def __init__(self, preferred_source='auto'):
         self.parsers = [
             BiqugeStyleParser(),
             SyosetuParser(),
         ]
+        self.preferred_source = preferred_source or 'auto'
         self.novel_title = ""
         self.novel_author = ""
         self.chapters = []
         self.output_dir = ""
+
+    def set_preferred_source(self, source):
+        self.preferred_source = source or 'auto'
 
     def add_custom_parser(self, parser):
         self.parsers.append(parser)
 
     def _find_parser(self, url):
         """找到匹配的解析器"""
+        preferred = (self.preferred_source or 'auto').lower()
+        if preferred in {'xbiquge', 'biquge', '69shu', 'biqubao'}:
+            return BiqugeStyleParser()
+        if preferred == 'syosetu':
+            return SyosetuParser()
         for p in self.parsers:
             if p.detect(url):
                 return p

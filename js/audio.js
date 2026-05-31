@@ -9,6 +9,7 @@ const AudioPlayer = (() => {
     voicesModal: document.getElementById('voices-modal'),
     voicesClose: document.getElementById('voices-close'),
     voicesGrid: document.getElementById('voices-grid'),
+    emotionGrid: document.getElementById('emotion-grid'),
     voicesNote: document.getElementById('voices-note'),
   };
 
@@ -19,14 +20,18 @@ const AudioPlayer = (() => {
   let _sentences = [];
   let _sentenceIndex = 0;
   let _voices = [];
+  let _emotions = [];
   let _voiceId = 'qinglang_male';
+  let _emotion = 'auto';
   let _prefetchCache = {};
   let _isPrefetching = false;
   let _speed = 1.0;
 
   async function init() {
     _voiceId = _loadVoiceId();
+    _emotion = _loadEmotion();
     _speed = _loadSpeed();
+    await loadEmotions();
     await loadVoices();
     _bindEvents();
   }
@@ -123,6 +128,15 @@ const AudioPlayer = (() => {
     }
   }
 
+  function _loadEmotion() {
+    try {
+      const settings = JSON.parse(localStorage.getItem('novel_settings') || '{}');
+      return settings.emotion || 'auto';
+    } catch (_e) {
+      return 'auto';
+    }
+  }
+
   function _loadSpeed() {
     try {
       return parseFloat(localStorage.getItem('novel_tts_speed')) || 1.0;
@@ -142,9 +156,18 @@ const AudioPlayer = (() => {
 
   function _saveVoiceId(voiceId) {
     _voiceId = voiceId;
+    _saveSetting('voiceId', voiceId);
+  }
+
+  function _saveEmotion(emotion) {
+    _emotion = emotion || 'auto';
+    _saveSetting('emotion', _emotion);
+  }
+
+  function _saveSetting(key, value) {
     try {
       const settings = JSON.parse(localStorage.getItem('novel_settings') || '{}');
-      settings.voiceId = voiceId;
+      settings[key] = value;
       localStorage.setItem('novel_settings', JSON.stringify(settings));
       fetch('/api/settings', {
         method: 'POST',
@@ -152,6 +175,27 @@ const AudioPlayer = (() => {
         body: JSON.stringify(settings),
       }).catch(() => {});
     } catch (_e) {}
+  }
+
+  async function loadEmotions() {
+    try {
+      const response = await fetch('/api/tts/emotions');
+      const data = await response.json();
+      _emotions = data.emotions || [];
+    } catch (_e) {
+      _emotions = [];
+    }
+    if (!_emotions.length) {
+      _emotions = [
+        { id: 'auto', name: '自动识别' },
+        { id: 'neutral', name: '平静' },
+        { id: 'happy', name: '开心' },
+        { id: 'sad', name: '悲伤' },
+        { id: 'angry', name: '愤怒' },
+        { id: 'surprise', name: '惊讶' },
+      ];
+    }
+    _renderEmotions();
   }
 
   async function loadVoices() {
@@ -192,10 +236,25 @@ const AudioPlayer = (() => {
     const installed = _voices.some(voice => voice.installed);
     els.voicesNote.textContent = installed
       ? '点击音色可试听并设为默认朗读音色'
-      : '本地TTS模型未安装：后端会返回明确错误，安装 ChatTTS 后即可生成音频';
+      : '本地 ChatTTS 模型不可用：安装依赖或等待模型下载完成后即可生成音频';
 
     // Add speed control below the note
     _renderSpeedControl();
+  }
+
+  function _renderEmotions() {
+    if (!els.emotionGrid) return;
+    els.emotionGrid.innerHTML = '';
+    _emotions.forEach(emotion => {
+      const btn = document.createElement('button');
+      btn.className = `emotion-option ${emotion.id === _emotion ? 'active' : ''}`;
+      btn.textContent = emotion.name;
+      btn.addEventListener('click', () => {
+        _saveEmotion(emotion.id);
+        _renderEmotions();
+      });
+      els.emotionGrid.appendChild(btn);
+    });
   }
 
   function _renderSpeedControl() {
@@ -391,7 +450,7 @@ const AudioPlayer = (() => {
       const response = await fetch('/api/tts/synthesize_batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ texts: batchTexts, voiceId: _voiceId }),
+          body: JSON.stringify({ texts: batchTexts, voiceId: _voiceId, emotion: _emotion }),
       });
       if (!response.ok) { _isPrefetching = false; return; }
       const data = await response.json();
@@ -413,7 +472,7 @@ const AudioPlayer = (() => {
     const response = await fetch('/api/tts/synthesize', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, voiceId }),
+      body: JSON.stringify({ text, voiceId, emotion: _emotion }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {

@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <title>AI 有声小说</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="css/style.css">
   <link rel="stylesheet" href="css/themes.css">
 </head>
@@ -73,6 +74,10 @@
 
 <div class="modal-overlay sheet-overlay" id="settings-modal">
   <div class="settings-panel">
+    <div class="settings-header">
+      <h3>阅读设置</h3>
+      <button class="icon-btn close-btn" id="settings-close">×</button>
+    </div>
     <div class="settings-body">
       <div class="setting-row">
         <span class="setting-label">☼</span>
@@ -141,6 +146,10 @@
       <button class="icon-btn close-btn" id="voices-close">×</button>
     </div>
     <div class="voices-grid" id="voices-grid"></div>
+    <div class="emotion-panel">
+      <div class="emotion-title">朗读情感</div>
+      <div class="emotion-grid" id="emotion-grid"></div>
+    </div>
     <div class="voices-note" id="voices-note"></div>
   </div>
 </div>

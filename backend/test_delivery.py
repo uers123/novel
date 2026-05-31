@@ -1,12 +1,17 @@
 import io
 import os
 import shutil
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
+os.environ.setdefault("NOVEL_READER_MOCK_TTS", "1")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import app as app_module
-from app import NovelManager, app
+from app import NovelManager, app, write_json
 
 
 class FakeChapter:
@@ -17,7 +22,11 @@ class FakeChapter:
 
 
 class FakeCrawler:
-    def __init__(self):
+    last_preferred_source = None
+
+    def __init__(self, preferred_source="auto"):
+        FakeCrawler.last_preferred_source = preferred_source
+        self.preferred_source = preferred_source
         self.novel_title = "测试爬取小说"
         self.novel_author = "测试作者"
         self.chapters = [
@@ -37,14 +46,17 @@ class BackendTestCase(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp()
         self.old_manager = app_module.novel_manager
         self.old_settings_file = app_module.SETTINGS_FILE
+        self.old_uploads_dir = app_module.UPLOADS_DIR
         self.manager = NovelManager(Path(self.temp_dir) / "novels")
         app_module.novel_manager = self.manager
         app_module.SETTINGS_FILE = Path(self.temp_dir) / "settings.json"
+        app_module.UPLOADS_DIR = Path(self.temp_dir) / "uploads"
         self.client = app.test_client()
 
     def tearDown(self):
         app_module.novel_manager = self.old_manager
         app_module.SETTINGS_FILE = self.old_settings_file
+        app_module.UPLOADS_DIR = self.old_uploads_dir
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _txt_file(self, content):
@@ -77,11 +89,38 @@ class TestTxtImport(BackendTestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.get_json()["novel"]["title"], "上传书")
 
+    def test_chunked_upload_api(self):
+        response = self.client.post(
+            "/api/novels/import/start",
+            json={"filename": "big.txt", "title": "大文件", "author": "作者", "totalSize": 24},
+        )
+        self.assertEqual(response.status_code, 201)
+        upload_id = response.get_json()["uploadId"]
+
+        chunks = [b"\xe7\xac\xac\xe4\xb8\x80\xe7\xab\xa0 \xe5\xa4\xa7\n", "正文。".encode("utf-8")]
+        for index, payload in enumerate(chunks):
+            response = self.client.post(
+                "/api/novels/import/chunk",
+                data={"uploadId": upload_id, "chunkIndex": str(index), "chunk": (io.BytesIO(payload), f"{index}.part")},
+                content_type="multipart/form-data",
+            )
+            self.assertEqual(response.status_code, 200)
+
+        response = self.client.post("/api/novels/import/complete", json={"uploadId": upload_id})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["novel"]["title"], "大文件")
+
+    def test_cancel_chunked_upload(self):
+        response = self.client.post("/api/novels/import/start", json={"filename": "cancel.txt"})
+        upload_id = response.get_json()["uploadId"]
+        response = self.client.delete(f"/api/novels/import/{upload_id}")
+        self.assertEqual(response.status_code, 200)
+
 
 class TestCrawlImport(BackendTestCase):
     def setUp(self):
         super().setUp()
-        self.manager._new_crawler = lambda: FakeCrawler()
+        self.manager._new_crawler = lambda source_type="auto": FakeCrawler(source_type)
 
     def test_import_url_catalog_and_lazy_load_chapter(self):
         result = self.manager.import_from_crawl("https://example.test/catalog", prefetch_chapters=0)
@@ -98,12 +137,28 @@ class TestCrawlImport(BackendTestCase):
     def test_import_url_api(self):
         response = self.client.post(
             "/api/novels/import-url",
-            json={"url": "https://example.test/catalog", "prefetchChapters": 0},
+            json={"url": "https://example.test/catalog", "prefetchChapters": 0, "sourceType": "syosetu"},
         )
         self.assertEqual(response.status_code, 201)
         payload = response.get_json()
         self.assertEqual(payload["novel"]["chapterCount"], 2)
         self.assertEqual(payload["crawlStatus"]["prefetchTarget"], 0)
+        self.assertEqual(FakeCrawler.last_preferred_source, "syosetu")
+
+    def test_concurrent_json_writes_are_stable(self):
+        path = Path(self.temp_dir) / "status.json"
+
+        def worker(index):
+            write_json(path, {"index": index})
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertTrue(path.exists())
+        self.assertIn("index", app_module.read_json(path, {}))
 
 
 class TestSettingsAndTTS(BackendTestCase):
@@ -120,10 +175,14 @@ class TestSettingsAndTTS(BackendTestCase):
         self.assertGreater(len(response.get_json()["voices"]), 0)
 
         response = self.client.post("/api/tts/synthesize", json={"text": "测试朗读", "voiceId": "qinglang_male"})
-        self.assertIn(response.status_code, (200, 503))
-        if response.status_code == 503:
-            self.assertFalse(response.get_json()["installed"])
-            self.assertIn("MeloTTS", response.get_json()["error"])
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["mock"])
+        self.assertIn("/api/tts/audio/", payload["audioUrl"])
+
+        response = self.client.get("/api/tts/emotions")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("auto", [item["id"] for item in response.get_json()["emotions"]])
 
 
 class TestTranslation(BackendTestCase):
@@ -149,15 +208,26 @@ class TestTranslation(BackendTestCase):
 class TestFrontendStatic(BackendTestCase):
     def test_static_shell_contains_target_surfaces(self):
         response = self.client.get("/")
-        html = response.data.decode("utf-8")
-        for marker in ["view-reader", "settings-modal", "voices-modal", "audio-bar", "translation-modal"]:
-            self.assertIn(marker, html)
+        try:
+            html = response.data.decode("utf-8")
+            for marker in ["view-reader", "settings-modal", "settings-close", "voices-modal", "audio-bar", "translate-modal", "emotion-grid"]:
+                self.assertIn(marker, html)
+        finally:
+            response.close()
 
     def test_js_and_css_assets_load(self):
         for filename in ["app.js", "reader.js", "settings.js", "audio.js", "toc.js", "data.js"]:
-            self.assertEqual(self.client.get(f"/js/{filename}").status_code, 200, filename)
+            response = self.client.get(f"/js/{filename}")
+            try:
+                self.assertEqual(response.status_code, 200, filename)
+            finally:
+                response.close()
         for filename in ["style.css", "themes.css"]:
-            self.assertEqual(self.client.get(f"/css/{filename}").status_code, 200, filename)
+            response = self.client.get(f"/css/{filename}")
+            try:
+                self.assertEqual(response.status_code, 200, filename)
+            finally:
+                response.close()
 
 
 if __name__ == "__main__":

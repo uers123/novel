@@ -9,6 +9,8 @@ build/
 # 后端临时文件
 backend/novels/
 backend/settings.json
+backend/tts_cache/
+backend/uploads/
 backend/*.pyc
 
 # 模型文件 (8GB+)
@@ -26,6 +28,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.iml
+.claude/
 
 # 日志
 *.log
