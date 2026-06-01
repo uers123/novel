@@ -669,7 +669,6 @@ class TTSService:
                 sys.path.insert(0, _sp)
                 try:
                     import ChatTTS  # noqa: F401
-                    import sys
                     print(f"  ChatTTS found via fallback path: {_sp}", file=sys.stderr)
                     return
                 except ImportError:
